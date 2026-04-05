@@ -1,0 +1,78 @@
+
+> fly-chat@0.0.0 lint
+> eslint .
+
+
+S:\FLYCHAT UI\fly-chat\src\api\chatApi.ts
+  202:52  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+S:\FLYCHAT UI\fly-chat\src\components\AuthenticatedAvatar.tsx
+  28:57  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+S:\FLYCHAT UI\fly-chat\src\hooks\useAuthenticatedImage.ts
+  76:6  warning  React Hook useEffect has a missing dependency: 'encryptionKeys'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+S:\FLYCHAT UI\fly-chat\src\hooks\useChatConnection.ts
+  242:11  error    'processedMessage' is never reassigned. Use 'const' instead                                                                         prefer-const
+  259:25  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  267:29  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  268:26  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  272:49  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  283:41  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  288:66  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  297:25  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  312:5   warning  React Hook useCallback has a missing dependency: 'resetEncryption'. Either include it or remove the dependency array                react-hooks/exhaustive-deps
+  321:15  error    'processedMessage' is never reassigned. Use 'const' instead                                                                         prefer-const
+  324:63  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  333:22  error    'error' is defined but never used                                                                                                   @typescript-eslint/no-unused-vars
+  348:24  error    'error' is defined but never used                                                                                                   @typescript-eslint/no-unused-vars
+  416:5   warning  React Hook useCallback has a missing dependency: 'processMessagesWithDecryption'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+  445:5   warning  React Hook useCallback has a missing dependency: 'processMessagesWithDecryption'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+  487:6   warning  React Hook useCallback has a missing dependency: 'processMessagesWithDecryption'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+  530:62  error    Unexpected any. Specify a different type                                                                                            @typescript-eslint/no-explicit-any
+  545:20  error    'e' is defined but never used                                                                                                       @typescript-eslint/no-unused-vars
+  575:5   warning  React Hook useCallback has an unnecessary dependency: 'ensureGroupHistory'. Either exclude it or remove the dependency array        react-hooks/exhaustive-deps
+  628:5   warning  React Hook useCallback has a missing dependency: 'groupMessages'. Either include it or remove the dependency array                  react-hooks/exhaustive-deps
+  746:13  error    'finalMessage' is never reassigned. Use 'const' instead                                                                             prefer-const
+  769:22  error    'e' is defined but never used                                                                                                       @typescript-eslint/no-unused-vars
+
+S:\FLYCHAT UI\fly-chat\src\services\EncryptionService.ts
+   33:49  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+   34:48  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+   67:40  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+   97:73  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+   97:87  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  103:63  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  104:27  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  120:59  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  140:58  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  185:54  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  192:59  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  213:17  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  396:30  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  399:94  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  403:9   error  'keysForMembers' is never reassigned. Use 'const' instead  prefer-const
+  403:40  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  452:75  error  Unexpected any. Specify a different type                   @typescript-eslint/no-explicit-any
+  465:9   error  'groupKey' is never reassigned. Use 'const' instead        prefer-const
+
+S:\FLYCHAT UI\fly-chat\src\services\SignalStore.ts
+   12:39  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   42:5   error  '_direction' is defined but never used    @typescript-eslint/no-unused-vars
+   51:53  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   65:54  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   90:59  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  107:60  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  115:50  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  119:50  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  140:38  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  153:52  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  157:50  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  189:27  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+S:\FLYCHAT UI\fly-chat\src\types\chat.ts
+  74:24  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+Γ£û 56 problems (49 errors, 7 warnings)
+  5 errors and 0 warnings potentially fixable with the `--fix` option.
+
