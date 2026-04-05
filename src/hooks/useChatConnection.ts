@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { SignalProtocolAddress } from '@privacyresearch/libsignal-protocol-typescript'
+// import { SignalProtocolAddress } from '@privacyresearch/libsignal-protocol-typescript'
 import { fetchAuthenticatedUser, loginUser } from '../api/authApi'
 import {
   fetchBootstrap,
@@ -14,10 +14,10 @@ import {
   uploadProfilePicture as apiUploadProfilePicture,
   apiCreateGroup,
   uploadEncryptionKeys,
-  fetchUserEncryptionBundle,
+  // fetchUserEncryptionBundle,
   updateProfile as apiUpdateProfile,
 } from '../api/chatApi'
-import { encryptionService, groupEncryptionService } from '../services/EncryptionService'
+import { encryptionService /* , groupEncryptionService */ } from '../services/EncryptionService'
 import type {
   ActiveConversation,
   AuthSession,
@@ -254,6 +254,7 @@ export function useChatConnection() {
       }
       
       let processedMessage = { ...message }
+      /* 
       if (processedMessage.isEncrypted && currentUser) {
         if (!processedMessage.roomId && processedMessage.senderId === currentUser.username) {
           typing.clearSenderTyping(processedMessage.senderId)
@@ -304,6 +305,7 @@ export function useChatConnection() {
           processedMessage.content = '[Encrypted Group Message - Decryption Failed]'
         }
       }
+      */
 
       typing.clearSenderTyping(processedMessage.senderId)
       appendIncomingMessage(processedMessage)
@@ -315,6 +317,8 @@ export function useChatConnection() {
     async (messages: ChatMessage[]) => {
       if (!currentUser) return messages
 
+      return messages
+      /*
       const processed = await Promise.all(
         messages.map(async (msg) => {
           let processedMessage = { ...msg }
@@ -351,6 +355,7 @@ export function useChatConnection() {
         })
       )
       return processed
+      */
     },
     [currentUser]
   )
@@ -486,6 +491,7 @@ export function useChatConnection() {
         const authenticatedUser = await fetchAuthenticatedUser(authenticatedSession.token)
         setCurrentUser(authenticatedUser)
 
+        /* 
         try {
           await encryptionService.setAccountContext(authenticatedUser)
           await encryptionService.initialize()
@@ -498,6 +504,7 @@ export function useChatConnection() {
         } catch (e) {
           console.error('E2EE bootstrap failed:', e)
         }
+        */
 
         const [bootstrapData, liveContacts, liveGroups] = await Promise.all([
           fetchBootstrap(authenticatedSession.token),
@@ -552,7 +559,7 @@ export function useChatConnection() {
         setSession(nextSession)
         bootstrappedTokenRef.current = nextSession.token
         
-        await encryptionService.setAccountContext(nextSession.user, password)
+        // await encryptionService.setAccountContext(nextSession.user, password)
         await bootstrapAuthenticatedChat(nextSession)
       } catch (error: any) {
         console.error('Login process failed:', error)
@@ -617,6 +624,7 @@ export function useChatConnection() {
         timestamp: new Date().toISOString(),
       }
 
+      /* 
       if (activeConversation.type === 'direct' && token) {
         try {
           let bundle = await fetchUserEncryptionBundle(activeConversation.contact.id, token)
@@ -636,6 +644,7 @@ export function useChatConnection() {
           console.error('Group encryption failed:', e)
         }
       }
+      */
 
       sendSocketMessage(finalMessage)
       appendIncomingMessage({ ...finalMessage, content: trimmedText, isEncrypted: false })
@@ -651,13 +660,13 @@ export function useChatConnection() {
       setUploading(true)
       try {
         let fileToUpload: File | Blob = file
-        let encryptionKeys: { key: string; iv: string } | undefined = undefined
+        // let encryptionKeys: { key: string; iv: string } | undefined = undefined
 
         if (activeConversation.type === 'direct') {
           try {
             const encryptedData = await encryptionService.encryptFile(file)
             fileToUpload = encryptedData.encryptedBlob
-            encryptionKeys = { key: encryptedData.key, iv: encryptedData.iv }
+            // encryptionKeys = { key: encryptedData.key, iv: encryptedData.iv }
           } catch (e) {
             console.error('File encryption failed:', e)
           }
@@ -666,7 +675,12 @@ export function useChatConnection() {
         const uploaded = await uploadMedia(fileToUpload as File, token)
         setMediaLibrary((current) => ({ ...current, [uploaded.id]: uploaded }))
 
-        let finalMessage: ChatMessage = {
+        /* 
+        if (activeConversation.type === 'direct') {
+          // File encryption skip
+        }
+        */
+        const finalMessage: ChatMessage = {
           senderId: currentUser.username,
           senderName: currentUser.displayName,
           roomId: activeConversation.type === 'group' ? activeConversation.group.roomId : undefined,
@@ -676,6 +690,7 @@ export function useChatConnection() {
           timestamp: new Date().toISOString(),
         }
 
+        /* 
         if (activeConversation.type === 'direct' && encryptionKeys) {
           try {
             let bundle = await fetchUserEncryptionBundle(activeConversation.contact.id, token)
@@ -688,6 +703,7 @@ export function useChatConnection() {
             console.error('Signal encryption of media keys failed:', e)
           }
         }
+        */
 
         sendSocketMessage(finalMessage)
         appendIncomingMessage({ ...finalMessage, isEncrypted: false })

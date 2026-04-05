@@ -1,0 +1,4 @@
+src/hooks/useChatConnection.ts(2,1): error TS6133: 'SignalProtocolAddress' is declared but its value is never read.
+src/hooks/useChatConnection.ts(17,3): error TS6133: 'fetchUserEncryptionBundle' is declared but its value is never read.
+src/hooks/useChatConnection.ts(20,29): error TS6133: 'groupEncryptionService' is declared but its value is never read.
+src/hooks/useChatConnection.ts(663,13): error TS6133: 'encryptionKeys' is declared but its value is never read.
