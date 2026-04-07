@@ -1083,5 +1083,6 @@ export function useChatConnection() {
     loadMoreHistory,
     hasNextPage,
     isLoadingMore: loadingHistory,
+    resetEncryption,
   }
 }
