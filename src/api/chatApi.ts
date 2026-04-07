@@ -14,7 +14,7 @@ async function readErrorMessage(response: Response) {
   return text || `${response.status} ${response.statusText}`
 }
 
-function authHeaders(token: string) {
+export function authHeaders(token: string) {
   return {
     Accept: 'application/json',
     Authorization: `Bearer ${token}`,
@@ -200,13 +200,36 @@ export async function apiCreateGroup(data: CreateGroupRequest, token: string) {
 }
 
 export async function uploadEncryptionKeys(bundle: any, token: string) {
+  // Backend schema: KeyRegistrationRequest {
+  //   registrationId, identityPublicKey,
+  //   signedPreKey: { keyId, publicKey, signature },
+  //   oneTimePreKeys: [{ keyId, publicKey }, ...]   ← array
+  // }
+  // getEncryptionBundle() already produces this exact shape — send it as-is.
+  const payload = {
+    registrationId:   bundle.registrationId,
+    identityPublicKey: bundle.identityPublicKey,
+    signedPreKey:     bundle.signedPreKey,          // { keyId, publicKey, signature }
+    oneTimePreKeys:   (bundle.oneTimePreKeys ?? []).map((pk: any) => ({
+      keyId:     pk.keyId,
+      publicKey: pk.publicKey,
+    })),
+  }
+
+  console.debug(
+    '[E2EE] uploadEncryptionKeys | regId:', payload.registrationId,
+    '| sigPreKeyId:', payload.signedPreKey?.keyId,
+    '| sigLen:', payload.signedPreKey?.signature?.length ?? 0,
+    '| oneTimePreKeys count:', payload.oneTimePreKeys.length
+  )
+
   const response = await fetch(`${API_BASE_URL}/api/chat/keys`, {
     method: 'POST',
     headers: {
       ...authHeaders(token),
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(bundle),
+    body: JSON.stringify(payload),
   })
 
   if (!response.ok) {
@@ -223,7 +246,27 @@ export async function fetchUserEncryptionBundle(username: string, token: string)
     throw new Error(`Failed to fetch encryption bundle for ${username}: ${await readErrorMessage(response)}`)
   }
 
-  return await response.json()
+  const raw = await response.json()
+
+  // ── Normalise backend shape → frontend shape ─────────────────────────────
+  // Backend returns { oneTimePreKey: { keyId, publicKey } }  (singular object)
+  // Frontend expects { oneTimePreKeys: [{ keyId, publicKey }] }  (array)
+  const normalised: any = {
+    registrationId: raw.registrationId,
+    identityPublicKey: raw.identityPublicKey,
+    signedPreKey: raw.signedPreKey,   // { keyId, publicKey, signature } – matches
+    // Wrap the singular pre-key into an array; drop nulls
+    oneTimePreKeys: raw.oneTimePreKey
+      ? [{ keyId: raw.oneTimePreKey.keyId, publicKey: raw.oneTimePreKey.publicKey }]
+      : (raw.oneTimePreKeys ?? []),
+  }
+
+  console.debug('[E2EE] fetchUserEncryptionBundle →', username,
+    '| regId:', normalised.registrationId,
+    '| sigPreKeyId:', normalised.signedPreKey?.keyId,
+    '| oneTimePreKeys:', normalised.oneTimePreKeys.length)
+
+  return normalised
 }
 
 export async function updateProfile(data: { displayName: string; about?: string }, token: string) {
@@ -242,3 +285,7 @@ export async function updateProfile(data: { displayName: string; about?: string 
 
   return await response.json()
 }
+
+// ─── Message Vault API ──────────────────────────────────────────────────────
+// Zero-knowledge storage: server only ever sees ciphertext, never plaintext.
+

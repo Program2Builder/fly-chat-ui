@@ -16,6 +16,17 @@ export class EncryptionService {
   private context: { user: any; password?: string } | null = null
 
   constructor() {}
+  
+  /**
+   * Resets the service context and store. 
+   * MUST be called on logout to prevent session crossover.
+   */
+  public logout(): void {
+    this._store = null;
+    this.context = null;
+    this.initialized = false;
+    this.initializationPromise = null;
+  }
 
   /**
    * Binds the service to a specific backend account.
@@ -33,6 +44,17 @@ export class EncryptionService {
       throw new Error('EncryptionService: Account context not set. Call setAccountContext first.')
     }
     return this._store
+  }
+
+  /**
+   * Returns true when the service already has a context set for the given user.
+   * Used to avoid double-initialization (login vs session-restore paths).
+   */
+  public isContextSet(userId?: number | string): boolean {
+    if (!this._store || !this.context) return false
+    if (userId === undefined) return true
+    const currentId = String(this.context.user?.id ?? this.context.user?.username ?? '')
+    return currentId === String(userId)
   }
 
   private ensureStore(): SignalProtocolStore {
@@ -95,6 +117,23 @@ export class EncryptionService {
     return this.initializationPromise
   }
 
+  /**
+   * Wipes all Signal keys from IndexedDB and resets in-memory state.
+   * The caller MUST call setAccountContext() + initialize() afterwards
+   * to generate and upload a fresh key set.
+   */
+  async reset(): Promise<void> {
+    if (this._store) {
+      console.log('[E2EE] Wiping all local keys from IndexedDB...')
+      await this._store.deleteAllData()
+      console.log('[E2EE] Local key store cleared.')
+    }
+    // Reset flags but keep _store and context so resetEncryption() can
+    // immediately call initialize() without needing a full re-login.
+    this.initialized = false
+    this.initializationPromise = null
+  }
+
   private async deriveSeedFromPassword(password: string, salt: string): Promise<ArrayBuffer> {
     const enc = new TextEncoder()
     const passwordKey = await window.crypto.subtle.importKey(
@@ -118,23 +157,22 @@ export class EncryptionService {
     return bits
   }
 
-  async reset(): Promise<void> {
-    if (this._store) {
-      await this._store.deleteAllData()
-    }
-    this.initialized = false
-    this.initializationPromise = null
-    this.context = null
-    this._store = null
-  }
-
   async getEncryptionBundle(): Promise<any> {
     await this.initialize()
     const store = this.ensureStore()
 
     const registrationId = await store.getLocalRegistrationId()
     const identityKey = await store.getIdentityKeyPair()
+    if (!identityKey?.pubKey) throw new Error('[E2EE] Cannot build bundle: identity key missing from store.')
+
     const signedPreKey = await store.loadSignedPreKey(1)
+    if (!signedPreKey?.pubKey) throw new Error('[E2EE] Cannot build bundle: signed pre-key missing from store.')
+    if (!signedPreKey?.signature) {
+      throw new Error(
+        '[E2EE] Cannot build bundle: signed pre-key SIGNATURE is missing. ' +
+        'The SignalStore.loadSignedPreKey() must return the signature field.'
+      )
+    }
 
     const oneTimePreKeys = []
     for (let i = 0; i < 20; i++) {
@@ -147,16 +185,71 @@ export class EncryptionService {
       }
     }
 
-    return {
+    const bundle = {
       registrationId,
-      identityPublicKey: this.arrayBufferToBase64(identityKey!.pubKey),
+      identityPublicKey: this.arrayBufferToBase64(identityKey.pubKey),
       signedPreKey: {
         keyId: 1,
-        publicKey: this.arrayBufferToBase64(signedPreKey!.pubKey),
-        signature: this.arrayBufferToBase64(signedPreKey!.signature)
+        publicKey: this.arrayBufferToBase64(signedPreKey.pubKey),
+        signature: this.arrayBufferToBase64(signedPreKey.signature)
       },
       oneTimePreKeys
     }
+
+    // Sanity-check: signature must be a non-empty base64 string
+    if (!bundle.signedPreKey.signature) {
+      throw new Error('[E2EE] Signed pre-key signature serialized to empty string. Aborting bundle upload.')
+    }
+
+    console.debug('[E2EE] getEncryptionBundle | sigLen:', bundle.signedPreKey.signature.length,
+      '| preKeys:', oneTimePreKeys.length)
+    return bundle
+  }
+
+  /**
+   * Eagerly performs an X3DH key agreement with a recipient using their public
+   * bundle fetched from the server.  Call this when a direct conversation is
+   * opened so the Signal session is ready before the first message is sent.
+   *
+   * If a session already exists for this recipient the call is a no-op.
+   */
+  async preEstablishSession(recipientId: string, bundle: any): Promise<void> {
+    if (!bundle?.identityPublicKey) {
+      console.warn('[E2EE] preEstablishSession: no bundle for', recipientId, '– skipping.')
+      return
+    }
+
+    await this.initialize()
+    const address = new SignalProtocolAddress(recipientId, 1)
+    const store = this.ensureStore()
+
+    const hasSession = await store.loadSession(address.toString())
+    if (hasSession) {
+      console.debug('[E2EE] Session already exists for', recipientId, '– no X3DH needed.')
+      return
+    }
+
+    const sessionBuilder = new SessionBuilder(store as any, address)
+    const preKeyBundle: any = {
+      registrationId: bundle.registrationId,
+      identityKey: this.base64ToArrayBuffer(bundle.identityPublicKey),
+      signedPreKey: {
+        keyId: bundle.signedPreKey.keyId,
+        publicKey: this.base64ToArrayBuffer(bundle.signedPreKey.publicKey),
+        signature: this.base64ToArrayBuffer(bundle.signedPreKey.signature),
+      },
+      preKey: bundle.oneTimePreKeys?.[0]
+        ? {
+            keyId: bundle.oneTimePreKeys[0].keyId,
+            publicKey: this.base64ToArrayBuffer(bundle.oneTimePreKeys[0].publicKey),
+          }
+        : undefined,
+    }
+
+    await sessionBuilder.processPreKey(preKeyBundle)
+    console.log('[E2EE] Session pre-established with', recipientId,
+      '| regId:', bundle.registrationId,
+      '| preKeyId:', bundle.oneTimePreKeys?.[0]?.keyId ?? 'none')
   }
 
   async encryptMessage(recipientId: string, plaintext: string, bundle?: any): Promise<any> {
@@ -164,6 +257,22 @@ export class EncryptionService {
     const address = new SignalProtocolAddress(recipientId, 1)
 
     const store = this.ensureStore()
+
+    // ── KEY DEBUG ────────────────────────────────────────────────────────────
+    const localIdentity = await store.getIdentityKeyPair()
+    const localPubKeyHex = localIdentity?.pubKey
+      ? this.bufToHex(localIdentity.pubKey)
+      : '(none)'
+    const recipientPubKeyHex = bundle?.identityPublicKey
+      ? this.bufToHex(this.base64ToArrayBuffer(bundle.identityPublicKey))
+      : '(no bundle)'
+    console.groupCollapsed(`[E2EE] encryptMessage → ${recipientId}`)
+    console.log('  My identity pubkey  :', localPubKeyHex)
+    console.log('  Recipient pubkey    :', recipientPubKeyHex)
+    console.log('  Plaintext preview   :', plaintext.slice(0, 40))
+    console.groupEnd()
+    // ─────────────────────────────────────────────────────────────────────────
+
     const hasSession = await store.loadSession(address.toString())
     if (!hasSession && bundle) {
       const sessionBuilder = new SessionBuilder(store as any, address)
@@ -188,10 +297,12 @@ export class EncryptionService {
     const plainBuffer = encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength)
     const ciphertext = await sessionCipher.encrypt(plainBuffer);
 
-    const body = (ciphertext.body as any) instanceof ArrayBuffer 
-      ? this.arrayBufferToBase64(ciphertext.body as unknown as ArrayBuffer) 
-      : (ciphertext.body || '') as string
+    // libsignal might return Uint8Array or string (base64)
+    const body = (typeof ciphertext.body === 'string') 
+      ? ciphertext.body 
+      : (ciphertext.body ? this.toBase64(ciphertext.body) : '')
       
+    console.log(`[E2EE] encryptMessage done | type=${ciphertext.type} | bodyLen=${body.length}`)
     return {
       type: ciphertext.type,
       body: body,
@@ -202,35 +313,64 @@ export class EncryptionService {
   async decryptMessage(senderId: string, ciphertext: any): Promise<string> {
     await this.initialize();
 
-    // ── 1. Validate that OUR OWN private keys are present and sane ──────────
+    // Guard: ciphertext must exist and have a body
+    if (!ciphertext || !ciphertext.body) {
+      throw new Error(`[E2EE] decryptMessage called with missing ciphertext/body for sender=${senderId}`);
+    }
+
+    // Validate our own private keys before attempting any decryption
     await this.assertPrivateKeysValid();
 
     const store = this.ensureStore()
     const address = new SignalProtocolAddress(senderId, 1);
+
+    // ── KEY DEBUG ────────────────────────────────────────────────────────────
+    const localIdentity = await store.getIdentityKeyPair()
+    const localPubKeyHex = localIdentity?.pubKey
+      ? this.bufToHex(localIdentity.pubKey)
+      : '(none)'
+    const storedSenderIdentity = await store.loadSession(address.toString())
+    console.groupCollapsed(`[E2EE] decryptMessage ← ${senderId}`)
+    console.log('  My identity pubkey  :', localPubKeyHex)
+    console.log('  Session for sender  :', storedSenderIdentity ? 'EXISTS' : 'NONE (will X3DH)')
+    console.log('  Ciphertext type     :', ciphertext.type ?? '(none, using fallback=3)')
+    console.log('  Body length         :', String(ciphertext.body).length)
+    console.groupEnd()
+    // ─────────────────────────────────────────────────────────────────────────
+
     const sessionCipher = new SessionCipher(store as any, address);
 
-    // ── 2. Decode the body robustly ─────────────────────────────────────────
     const bodyBuffer = this.decodeBody(ciphertext.body);
 
-    // ── 3. Decrypt ──────────────────────────────────────────────────────────
-    let decrypted: ArrayBuffer;
-    try {
-      if (ciphertext.type === 3) {
-        // PreKeyWhisperMessage – triggers SessionBuilder internally,
-        // which needs our identity PRIVATE key + pre-key PRIVATE key.
-        decrypted = await sessionCipher.decryptPreKeyWhisperMessage(
-          bodyBuffer,
-          'binary'
+    // Helper that tries one message type, returns decrypted buffer or throws
+    const tryDecrypt = async (type: number): Promise<ArrayBuffer> => {
+      if (type === 3) {
+        // PreKeyWhisperMessage — establishes a new session
+        return await sessionCipher.decryptPreKeyWhisperMessage(
+          bodyBuffer, 'binary'
         ) as ArrayBuffer;
       } else {
-        decrypted = await sessionCipher.decryptWhisperMessage(
-          bodyBuffer,
-          'binary'
+        return await sessionCipher.decryptWhisperMessage(
+          bodyBuffer, 'binary'
         ) as ArrayBuffer;
       }
-    } catch (e: any) {
-      console.error(`[E2EE] Decryption failed | type=${ciphertext.type} | sender=${senderId} |`, e.message);
-      throw e;
+    }
+
+    let decrypted: ArrayBuffer;
+    const primaryType = ciphertext.type ?? 3;
+    const alternateType = primaryType === 3 ? 1 : 3;
+
+    try {
+      decrypted = await tryDecrypt(primaryType);
+    } catch (primaryErr: any) {
+      console.warn(`[E2EE] Primary decrypt (type=${primaryType}) failed, retrying with type=${alternateType}:`, primaryErr.message);
+      try {
+        decrypted = await tryDecrypt(alternateType);
+      } catch (altErr: any) {
+        // Both failed — re-throw the original error for upstream handling
+        console.error(`[E2EE] Both decrypt attempts failed | sender=${senderId}`);
+        throw primaryErr;
+      }
     }
 
     return new TextDecoder().decode(decrypted);
@@ -363,13 +503,27 @@ export class EncryptionService {
   }
 
   private arrayBufferToBase64(buffer: ArrayBuffer): string {
+    return this.toBase64(buffer)
+  }
+
+  /** Robustly converts ArrayBuffer or Uint8Array to base64 string. */
+  public toBase64(data: ArrayBuffer | Uint8Array): string {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
     let binary = ''
-    const bytes = new Uint8Array(buffer)
     const len = bytes.byteLength
     for (let i = 0; i < len; i++) {
       binary += String.fromCharCode(bytes[i])
     }
     return btoa(binary)
+  }
+
+  /** Converts an ArrayBuffer to a printable hex string (first 16 bytes + length suffix). */
+  private bufToHex(buf: ArrayBuffer): string {
+    const bytes = new Uint8Array(buf)
+    const hexBytes = Array.from(bytes.slice(0, 16))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join(' ')
+    return `${hexBytes}${bytes.length > 16 ? ' …' : ''} (${bytes.length}B)`
   }
 
   private base64ToArrayBuffer(base64: string): ArrayBuffer {
@@ -436,8 +590,8 @@ export class GroupEncryptionService {
     return {
       isGroupEncryption: true,
       roomId,
-      body: btoa(String.fromCharCode(...new Uint8Array(encryptedContent))),
-      iv: btoa(String.fromCharCode(...iv)),
+      body: this.service.toBase64(new Uint8Array(encryptedContent)),
+      iv: this.service.toBase64(iv),
       keys: Object.keys(keysForMembers).length > 0 ? keysForMembers : undefined
     }
   }

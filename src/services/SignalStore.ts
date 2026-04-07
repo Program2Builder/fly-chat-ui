@@ -100,10 +100,17 @@ export class SignalProtocolStore implements StorageType {
 
     const kp = spk.keyPair || spk;
 
-    // Return flattened structure matching KeyPairType
+    // NOTE: libsignal stores signed pre-keys as { keyId, keyPair, signature }.
+    // We must preserve the signature so getEncryptionBundle() can include it
+    // in the public key bundle uploaded to the server.
+    const signature = spk.signature ?? kp.signature
+
     return {
       pubKey: this.toBuffer(kp.pubKey || kp.publicKey),
-      privKey: this.toBuffer(kp.privKey || kp.privateKey)
+      privKey: this.toBuffer(kp.privKey || kp.privateKey),
+      // Return the signature so callers (e.g. getEncryptionBundle) can read it.
+      // libsignal's own internal usage only needs pubKey/privKey, so this is safe.
+      signature: signature ? this.toBuffer(signature) : undefined,
     };
   }
 

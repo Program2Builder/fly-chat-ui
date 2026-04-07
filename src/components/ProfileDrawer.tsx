@@ -46,6 +46,8 @@ export function ProfileDrawer({
   const [imageViewerOpen, setImageViewerOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [resetLoading, setResetLoading] = useState(false)
+  const [resetStatus, setResetStatus] = useState<'idle' | 'success' | 'error'>('idle')
+  const [resetError, setResetError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Profile Edit State
@@ -122,15 +124,26 @@ export function ProfileDrawer({
 
   const handleResetEncryption = async () => {
     if (!onResetEncryption) return
-    if (!window.confirm('Are you sure? This will clear all local encryption sessions. You will need to start new conversations to message securely.')) {
+    if (!window.confirm(
+      'Reset your E2EE keys?\n\n'
+      + '• Your local keys will be wiped and regenerated.\n'
+      + '• New keys will be uploaded to the server.\n'
+      + '• Contacts must re-open chat to re-establish sessions.'
+    )) {
       return
     }
 
     setResetLoading(true)
+    setResetStatus('idle')
+    setResetError(null)
     try {
       await onResetEncryption()
+      setResetStatus('success')
     } catch (err) {
-      console.error('Failed to reset encryption:', err)
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error('[E2EE] resetEncryption failed:', err)
+      setResetStatus('error')
+      setResetError(msg)
     } finally {
       setResetLoading(false)
     }
@@ -384,8 +397,27 @@ export function ProfileDrawer({
                   }
                 }}
               >
-                {resetLoading ? 'Resetting...' : 'Reset End-to-End Encryption'}
+                {resetLoading ? 'Resetting…' : 'Reset End-to-End Encryption'}
               </Button>
+
+              {/* Feedback below the button */}
+              {resetStatus === 'success' && (
+                <Box sx={{ mt: 1.5, p: 1.5, borderRadius: '10px', bgcolor: 'rgba(0,168,132,0.1)', border: '1px solid rgba(0,168,132,0.3)' }}>
+                  <Typography variant="caption" sx={{ color: '#00a884', fontWeight: 600 }}>
+                    ✅ Keys reset & uploaded successfully. Contacts must re-open the chat to re-establish secure sessions.
+                  </Typography>
+                </Box>
+              )}
+              {resetStatus === 'error' && resetError && (
+                <Box sx={{ mt: 1.5, p: 1.5, borderRadius: '10px', bgcolor: 'rgba(234,67,53,0.1)', border: '1px solid rgba(234,67,53,0.3)' }}>
+                  <Typography variant="caption" sx={{ color: '#ea4335', fontWeight: 600 }}>
+                    ❌ Reset failed: {resetError}
+                  </Typography>
+                  <Typography variant="caption" sx={{ display: 'block', color: '#8696a0', mt: 0.5 }}>
+                    Check the DevTools Console (F12) for details.
+                  </Typography>
+                </Box>
+              )}
             </Box>
           </Stack>
         </Box>

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-// import { SignalProtocolAddress } from '@privacyresearch/libsignal-protocol-typescript'
+import { SignalProtocolAddress } from '@privacyresearch/libsignal-protocol-typescript'
 import { fetchAuthenticatedUser, loginUser } from '../api/authApi'
 import {
   fetchBootstrap,
@@ -14,10 +14,13 @@ import {
   uploadProfilePicture as apiUploadProfilePicture,
   apiCreateGroup,
   uploadEncryptionKeys,
-  // fetchUserEncryptionBundle,
+  fetchUserEncryptionBundle,
   updateProfile as apiUpdateProfile,
 } from '../api/chatApi'
-import { encryptionService /* , groupEncryptionService */ } from '../services/EncryptionService'
+import { encryptionService, groupEncryptionService } from '../services/EncryptionService'
+import { cachePlaintext, getCachedPlaintext, setCacheUser } from '../services/MessagePlaintextCache'
+import { vaultApi } from '../api/vaultApi'
+import { deriveVaultKey, encryptForVault, decryptFromVault } from '../services/vaultCrypto'
 import type {
   ActiveConversation,
   AuthSession,
@@ -106,6 +109,43 @@ function appendMessageWithLiveMerge(messages: ChatMessage[], incoming: ChatMessa
   return merged
 }
 
+async function syncEntireVaultToCache(token: string, vaultKey: CryptoKey | null) {
+  if (!vaultKey) return
+  
+  console.group('[Vault] 🔄 Synchronization start')
+  let currentPage = 0
+  let totalRestored = 0
+  
+  try {
+    while (true) {
+      console.debug(`[Vault] Fetching page ${currentPage}...`)
+      const page = await vaultApi.fetchAll(token, currentPage, 50)
+      
+      if (page.entries.length > 0) {
+        await Promise.all(page.entries.map(async (item: any) => {
+          try {
+            const plaintext = await decryptFromVault(item.ciphertext, vaultKey)
+            if (plaintext) {
+              await cachePlaintext(item.messageId, plaintext)
+              totalRestored++
+            }
+          } catch (e) {
+            console.warn(`[Vault] Failed to decrypt entry ${item.messageId}:`, e)
+          }
+        }))
+      }
+      
+      if (!page.hasMore || page.entries.length === 0) break
+      currentPage++
+    }
+    console.log(`[Vault] ✅ Sync complete. Restored ${totalRestored} entries into cache.`)
+  } catch (error) {
+    console.error('[Vault] ❌ Synchronization failed:', error)
+  } finally {
+    console.groupEnd()
+  }
+}
+
 function normalizeContacts(contacts: ChatContact[]) {
   return [...contacts].sort((left, right) => {
     const leftTime = left.lastInteractionAt ? new Date(left.lastInteractionAt).getTime() : 0
@@ -126,8 +166,27 @@ export function useChatConnection() {
   const socketRef = useRef<ChatSocket | null>(null)
   const restoreSessionRef = useRef<AuthSession | null>(null)
   const bootstrappedTokenRef = useRef<string | null>(null)
+  
+  /**
+   * The zero-knowledge vault key. 
+   * Lives ONLY in memory and sessionStorage (for refresh survival).
+   */
+  const vaultKeyRef = useRef<CryptoKey | null>(null)
+  
+  /**
+   * Temporary store for outgoing messages awaiting server echo.
+   * We use a ref here to ensure the data is never stale in socket callbacks.
+   */
+  const vaultSyncQueueRef = useRef<Array<{
+    timestamp: number;
+    fingerprint: string;
+    content: string;
+  }>>([])
+  
   const [session, setSession] = useLocalStorage<AuthSession | null>('flychat-auth-session', null)
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(session?.user ?? null)
+  // Always-fresh ref — updated in sync with state but readable in stale closures
+  const currentUserRef = useRef<AuthUser | null>(session?.user ?? null)
   const [status, setStatus] = useState<ConnectionStatus>('disconnected')
   const [errors, setErrors] = useState<ChatError[]>([])
   const [isBootstrapping, setIsBootstrapping] = useState(Boolean(session?.token))
@@ -164,6 +223,25 @@ export function useChatConnection() {
     socketRef.current.publish(message)
   }, [])
 
+  // Keep the ref in sync with the state so all callbacks always see the live user
+  useEffect(() => { currentUserRef.current = currentUser }, [currentUser])
+
+  /**
+   * Fire-and-forget: encrypt `plaintext` with the vault key and store to server.
+   * Silently skips if vault key is unavailable (page refresh without password).
+   * Never throws — failures are logged only.
+   */
+  const encryptAndStoreToVault = useCallback(
+    (messageId: string | undefined, plaintext: string) => {
+      const vk = vaultKeyRef.current
+      if (!messageId || !token || !vk) return
+      encryptForVault(plaintext, vk)
+        .then((ciphertext) => vaultApi.store(messageId, ciphertext, token))
+        .catch((err) => console.debug('[Vault] Store skipped/failed:', err?.message))
+    },
+    [token],
+  )
+
   const handleSendTyping = useCallback(
     (message: ChatMessage) => {
       try {
@@ -177,6 +255,27 @@ export function useChatConnection() {
     [pushError, sendSocketMessage],
   )
 
+  /** Export key bytes → base64 → sessionStorage for refresh survival. */
+  const saveVaultKeyToSession = useCallback(async (key: CryptoKey) => {
+    try {
+      const raw = await window.crypto.subtle.exportKey('raw', key)
+      const b64 = btoa(String.fromCharCode(...new Uint8Array(raw)))
+      sessionStorage.setItem('fc-vk', b64)
+    } catch { /* sessionStorage unavailable */ }
+  }, [])
+
+  /** Restore key from sessionStorage if present. */
+  const restoreVaultKeyFromSession = useCallback(async () => {
+    try {
+      const raw = sessionStorage.getItem('fc-vk')
+      if (!raw) return null
+      const keyBytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0))
+      return await window.crypto.subtle.importKey(
+        'raw', keyBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
+      )
+    } catch { return null }
+  }, [])
+
   const typing = useTypingIndicator({
     userId: currentUser?.username ?? '',
     userName: currentUser?.displayName ?? '',
@@ -185,7 +284,10 @@ export function useChatConnection() {
 
   const appendIncomingMessage = useCallback(
     (message: ChatMessage) => {
-      if (!currentUser || message.type === 'TYPING') {
+      // Use the ref so this callback is never stale (called during bootstrap when
+      // currentUser state hasn't propagated yet)
+      const user = currentUserRef.current
+      if (!user || message.type === 'TYPING') {
         return
       }
 
@@ -208,7 +310,7 @@ export function useChatConnection() {
         return
       }
 
-      const conversationKey = getDirectConversationKey(message, currentUser.username)
+      const conversationKey = getDirectConversationKey(message, user.username)
       if (!conversationKey) {
         return
       }
@@ -232,19 +334,42 @@ export function useChatConnection() {
     [currentUser],
   )
 
-  const resetEncryption = useCallback(async () => {
-    if (!token) throw new Error('Not logged in')
+  const resetEncryption = useCallback(async (): Promise<void> => {
+    if (!token || !currentUser) {
+      console.error('[E2EE] resetEncryption: not logged in – token:', token, 'user:', currentUser)
+      throw new Error('You must be logged in to reset encryption keys.')
+    }
+
     setUploading(true)
+    console.group('[E2EE] 🔄 resetEncryption – start')
     try {
+      // Step 1: wipe all local keys
+      console.log('[E2EE] Step 1/4 – wiping local IndexedDB keys...')
       await encryptionService.reset()
+      console.log('[E2EE] Step 1/4 done.')
+
+      // Step 2: re-bind the service to the user
+      console.log('[E2EE] Step 2/4 – re-setting account context...')
+      await encryptionService.setAccountContext(currentUser)
+      console.log('[E2EE] Step 2/4 done. context user:', currentUser.username)
+
+      // Step 3: generate fresh keys
+      console.log('[E2EE] Step 3/4 – generating new identity keys...')
       await encryptionService.initialize()
+      console.log('[E2EE] Step 3/4 done.')
+
+      // Step 4: upload the new bundle to the server (unconditional)
+      console.log('[E2EE] Step 4/4 – fetching bundle & uploading to server...')
       const bundle = await encryptionService.getEncryptionBundle()
+      console.log('[E2EE] Bundle ready | sigLen:', bundle.signedPreKey?.signature?.length ?? 0,
+        '| preKeys:', bundle.oneTimePreKeys?.length ?? 0)
       await uploadEncryptionKeys(bundle, token)
-      console.log('E2EE has been manually reset and new keys uploaded.')
+      console.log('[E2EE] Step 4/4 done. ✅ New keys live on server.')
     } finally {
+      console.groupEnd()
       setUploading(false)
     }
-  }, [token])
+  }, [token, currentUser])
 
   const handleIncomingMessage = useCallback(
     async (message: ChatMessage) => {
@@ -254,75 +379,130 @@ export function useChatConnection() {
       }
       
       let processedMessage = { ...message }
-      /* 
-      if (processedMessage.isEncrypted && currentUser) {
-        if (!processedMessage.roomId && processedMessage.senderId === currentUser.username) {
+      const user = currentUserRef.current  // always-fresh, no stale closure
+
+      // Normalise isEncrypted: backend may use 'encrypted' or 'isEncrypted'
+      const isEnc = processedMessage.isEncrypted || (processedMessage as any).encrypted || false
+
+      if (isEnc && user) {
+        // Handle echoed own outgoing messages: we already rendered plaintext locally,
+        // but we MUST capture the server-assigned message ID to cache/vault it correctly
+        // so history looks correct after a page reload.
+        if (processedMessage.senderId === user.username) {
           typing.clearSenderTyping(processedMessage.senderId)
+          
+          const incomingTime = processedMessage.timestamp ? new Date(processedMessage.timestamp).getTime() : 0
+          // Calculate fingerprint without content (since echo is encrypted, local was plain)
+          const fingerprint = [
+            processedMessage.type,
+            processedMessage.senderId,
+            processedMessage.roomId ?? '',
+            [...(processedMessage.recipients ?? [])].sort().join(','),
+          ].join('|')
+
+          // Guard against HMR state desync (ensure it's an array)
+          if (!Array.isArray(vaultSyncQueueRef.current)) vaultSyncQueueRef.current = []
+
+          // Find the best match in the pending queue (matching fingerprint + within 30s window)
+          const matchIndex = vaultSyncQueueRef.current.findIndex(p => 
+            p.fingerprint === fingerprint && Math.abs(p.timestamp - incomingTime) < 30000
+          )
+          
+          if (matchIndex !== -1) {
+            const pending = vaultSyncQueueRef.current[matchIndex]
+            console.debug('[Vault] Echo matched: caching final ID', processedMessage.id)
+            void cachePlaintext(processedMessage.id, pending.content)
+            encryptAndStoreToVault(processedMessage.id, pending.content)
+            // Remove from queue
+            vaultSyncQueueRef.current.splice(matchIndex, 1)
+          }
           return
         }
 
-        try {
-          const decryptedText = await encryptionService.decryptMessage(
-            processedMessage.senderId,
-            processedMessage.encryptionMetadata
-          )
-          processedMessage.content = decryptedText
-        } catch (error: any) {
-          const isInvalidKey = error?.message?.includes('Invalid private key')
-          if (isInvalidKey) {
-            console.error('CRITICAL: Local encryption keys are invalid. Attempting silent repair.', error)
-            processedMessage.content = '[Security Repair in progress... Please refresh.]'
-            
-            if (!(window as any)._isRepairingSignal) {
-              (window as any)._isRepairingSignal = true;
-              resetEncryption()
-                .catch(err => console.error('Silent repair failed:', err))
-                .finally(() => {
-                  setTimeout(() => { (window as any)._isRepairingSignal = false; }, 5000);
-                });
-            }
-          } else {
-            processedMessage.content = '[Encrypted Message - Decryption Failed]'
-          }
-          
+        if (processedMessage.roomId && (processedMessage as any).isGroupEncryption) {
           try {
-            const address = new SignalProtocolAddress(processedMessage.senderId, 1)
-            await (encryptionService.getStore() as any).removeSession(address.toString())
-          } catch (e) {
-            console.error('Failed to clear broken session:', e)
+            const decryptedText = await groupEncryptionService.decryptGroupMessage(
+              processedMessage.roomId,
+              processedMessage.senderId,
+              processedMessage,
+              user.username
+            )
+            processedMessage.content = decryptedText
+            await cachePlaintext(processedMessage.id, decryptedText)   // ← cache
+            encryptAndStoreToVault(processedMessage.id, decryptedText) // ← vault (fire & forget)
+          } catch (error: any) {
+            console.warn('[E2EE] Group decryption failed:', error)
+            processedMessage.content = '[🔐 Encrypted group message – decryption failed]'
           }
-        }
-      } else if (processedMessage.roomId && (processedMessage as any).isGroupEncryption && currentUser) {
-        try {
-          const decryptedText = await groupEncryptionService.decryptGroupMessage(
-            processedMessage.roomId,
-            processedMessage.senderId,
-            processedMessage,
-            currentUser.username
-          )
-          processedMessage.content = decryptedText
-        } catch (error: any) {
-          processedMessage.content = '[Encrypted Group Message - Decryption Failed]'
+        } else if (!processedMessage.roomId) {
+          // Build a fallback ciphertext descriptor when encryptionMetadata is absent
+          const meta = processedMessage.encryptionMetadata ?? {
+            type: 3,
+            body: processedMessage.content,
+          }
+          console.debug('[E2EE] Decrypting from', processedMessage.senderId,
+            'meta type:', meta?.type, 'has body:', Boolean(meta?.body))
+          try {
+            const decryptedText = await encryptionService.decryptMessage(
+              processedMessage.senderId,
+              meta
+            )
+            processedMessage.content = decryptedText
+            await cachePlaintext(processedMessage.id, decryptedText)   // ← cache so reload works
+            encryptAndStoreToVault(processedMessage.id, decryptedText) // ← vault (fire & forget)
+          } catch (error: any) {
+            const isInvalidKey = error?.message?.includes('Invalid private key') ||
+                                 error?.message?.includes('identity private key')
+            if (isInvalidKey) {
+              console.error('[E2EE] CRITICAL: Local keys invalid. Triggering silent repair.', error)
+              processedMessage.content = '[🔐 Security repair in progress — please refresh]'
+              if (!(window as any)._isRepairingSignal) {
+                ;(window as any)._isRepairingSignal = true
+                resetEncryption()
+                  .catch(err => console.error('[E2EE] Silent repair failed:', err))
+                  .finally(() => { setTimeout(() => { (window as any)._isRepairingSignal = false }, 5000) })
+              }
+            } else {
+              console.warn('[E2EE] Decryption failed from', processedMessage.senderId, '| error:', error?.message)
+              processedMessage.content = '[🔐 Encrypted message – decryption failed]'
+            }
+            // Clear broken session so next message triggers a fresh X3DH
+            try {
+              const address = new SignalProtocolAddress(processedMessage.senderId, 1)
+              await (encryptionService.getStore() as any).removeSession(address.toString())
+            } catch (e) {
+              console.error('[E2EE] Failed to clear broken session:', e)
+            }
+          }
         }
       }
-      */
 
       typing.clearSenderTyping(processedMessage.senderId)
       appendIncomingMessage(processedMessage)
     },
-    [appendIncomingMessage, typing, currentUser, resetEncryption],
+    [appendIncomingMessage, typing, resetEncryption],  // currentUser removed — uses ref
   )
 
   const processMessagesWithDecryption = useCallback(
     async (messages: ChatMessage[]) => {
-      if (!currentUser) return messages
+      // Use the ref so this is never stale when called synchronously during bootstrap
+      const user = currentUserRef.current
+      if (!user) return messages
 
-      return messages
-      /*
       const processed = await Promise.all(
         messages.map(async (msg) => {
           let processedMessage = { ...msg }
-          if (!processedMessage.isEncrypted) return processedMessage
+
+          // Normalise isEncrypted field (backend may use either name)
+          const isEnc = processedMessage.isEncrypted || (processedMessage as any).encrypted || false
+          if (!isEnc) return processedMessage
+
+          // ── Cache first: never re-process an already-consumed Signal message ──
+          const cached = await getCachedPlaintext(processedMessage.id)
+          if (cached !== null) {
+            processedMessage.content = cached
+            return processedMessage
+          }
 
           if (processedMessage.roomId && (processedMessage as any).isGroupEncryption) {
             try {
@@ -330,24 +510,52 @@ export function useChatConnection() {
                 processedMessage.roomId,
                 processedMessage.senderId,
                 processedMessage,
-                currentUser.username
+                user.username
               )
               processedMessage.content = decryptedText
-            } catch (error) {
-              processedMessage.content = '[Encrypted Group Message - Decryption Failed]'
+              await cachePlaintext(processedMessage.id, decryptedText)
+              encryptAndStoreToVault(processedMessage.id, decryptedText) // ← vault (fire & forget)
+            } catch {
+              processedMessage.content = '[\uD83D\uDD10 Encrypted group message \u2013 decryption failed]'
             }
           } else if (!processedMessage.roomId) {
-            if (processedMessage.senderId === currentUser.username) {
-              processedMessage.content = '[Sent Encrypted Message]'
+            if (processedMessage.senderId === user.username) {
+              // Own sent DMs: Signal cannot decrypt its own ciphertext.
+              // Try to restore from the Message Vault before giving up.
+              const vk = vaultKeyRef.current
+              if (processedMessage.id && token && vk) {
+                try {
+                  const vaultItem = await vaultApi.fetchOne(processedMessage.id, token)
+                  if (vaultItem && vaultItem.ciphertext) {
+                    const decrypted = await decryptFromVault(vaultItem.ciphertext, vk)
+                    if (decrypted) {
+                      processedMessage.content = decrypted
+                      await cachePlaintext(processedMessage.id, decrypted)
+                      return processedMessage
+                    }
+                  }
+                } catch (e) {
+                  console.warn('[Vault] On-demand restore failed for', processedMessage.id, e)
+                }
+              }
+              // If vault restore also fails, THEN show a (more descriptive) placeholder
+              processedMessage.content = '[\uD83D\uDD10 Message vaulted \u2013 restoring...]'
             } else {
+              // Build fallback descriptor when encryptionMetadata is absent
+              const meta = processedMessage.encryptionMetadata ?? {
+                type: 3,
+                body: processedMessage.content,
+              }
               try {
                 const decryptedText = await encryptionService.decryptMessage(
                   processedMessage.senderId,
-                  processedMessage.encryptionMetadata
+                  meta
                 )
                 processedMessage.content = decryptedText
-              } catch (error) {
-                processedMessage.content = '[Encrypted Message - Decryption Failed]'
+                await cachePlaintext(processedMessage.id, decryptedText)
+                encryptAndStoreToVault(processedMessage.id, decryptedText) // ← vault (fire & forget)
+              } catch {
+                processedMessage.content = '[\uD83D\uDD10 Encrypted message \u2013 decryption failed]'
               }
             }
           }
@@ -355,9 +563,8 @@ export function useChatConnection() {
         })
       )
       return processed
-      */
     },
-    [currentUser]
+    [] // no currentUser dependency — reads from currentUserRef which is always fresh
   )
 
   const connectSocket = useCallback(
@@ -490,21 +697,52 @@ export function useChatConnection() {
       try {
         const authenticatedUser = await fetchAuthenticatedUser(authenticatedSession.token)
         setCurrentUser(authenticatedUser)
+        // Scope the plaintext cache to this user immediately
+        setCacheUser(authenticatedUser.id)
 
-        /* 
+        // ── Vault pre-warm — populate IndexedDB cache from server vault ───────────────
         try {
-          await encryptionService.setAccountContext(authenticatedUser)
-          await encryptionService.initialize()
-          
-          const existingBundle = await fetchUserEncryptionBundle(authenticatedUser.username, authenticatedSession.token)
-          if (!existingBundle) {
-            const bundle = await encryptionService.getEncryptionBundle()
-            await uploadEncryptionKeys(bundle, authenticatedSession.token)
+          if (!vaultKeyRef.current) {
+            const restoredKey = await restoreVaultKeyFromSession()
+            if (restoredKey) {
+              vaultKeyRef.current = restoredKey
+              console.log('[Vault] Pre-warming IndexedDB cache from server vault...')
+              void syncEntireVaultToCache(authenticatedSession.token, restoredKey)
+            }
           }
         } catch (e) {
-          console.error('E2EE bootstrap failed:', e)
+          console.warn('[Vault] Pre-warm failed:', e)
         }
-        */
+
+        try {
+          if (!encryptionService.isContextSet(authenticatedUser.id)) {
+            console.log('[E2EE] Session restore path – setting account context without password.')
+            await encryptionService.setAccountContext(authenticatedUser)
+            // Restore vault key from session if possible (redundant but safe)
+            const restoredKey = await restoreVaultKeyFromSession()
+            if (restoredKey) {
+              vaultKeyRef.current = restoredKey
+              void syncEntireVaultToCache(authenticatedSession.token, restoredKey)
+            }
+          }
+          await encryptionService.initialize()
+
+          const localBundle = await encryptionService.getEncryptionBundle()
+          let serverIdentityKey: string | null = null
+          try {
+            const existing = await fetchUserEncryptionBundle(authenticatedUser.username, authenticatedSession.token)
+            serverIdentityKey = existing?.identityPublicKey ?? null
+          } catch {
+            serverIdentityKey = null
+          }
+
+          const keysMatch = serverIdentityKey !== null && serverIdentityKey === localBundle.identityPublicKey
+          if (!keysMatch) {
+            await uploadEncryptionKeys(localBundle, authenticatedSession.token)
+          }
+        } catch (e) {
+          console.error('[E2EE] Bootstrap failed (non-fatal):', e)
+        }
 
         const [bootstrapData, liveContacts, liveGroups] = await Promise.all([
           fetchBootstrap(authenticatedSession.token),
@@ -548,7 +786,7 @@ export function useChatConnection() {
         setIsBootstrapping(false)
       }
     },
-    [connectSocket, setSession],
+    [connectSocket, setSession, processMessagesWithDecryption, restoreVaultKeyFromSession]
   )
 
   const login = useCallback(
@@ -559,23 +797,32 @@ export function useChatConnection() {
         setSession(nextSession)
         bootstrappedTokenRef.current = nextSession.token
         
-        // await encryptionService.setAccountContext(nextSession.user, password)
+        await encryptionService.setAccountContext(nextSession.user, password)
+        try {
+          const vk = await deriveVaultKey(password, String(nextSession.user.id))
+          vaultKeyRef.current = vk
+          await saveVaultKeyToSession(vk)
+          void syncEntireVaultToCache(nextSession.token, vk)
+        } catch (vaultErr) {
+          console.warn('[Vault] Key derivation failed:', vaultErr)
+        }
         await bootstrapAuthenticatedChat(nextSession)
       } catch (error: any) {
         console.error('Login process failed:', error)
-        const readable = error instanceof Error ? error.message : 'Unable to log in.'
-        pushError('rest', readable)
+        pushError('rest', error instanceof Error ? error.message : 'Unable to log in.')
         throw error
       }
     },
-    [bootstrapAuthenticatedChat, clearErrors, pushError, setSession],
+    [bootstrapAuthenticatedChat, clearErrors, pushError, saveVaultKeyToSession, setSession]
   )
 
   const logout = useCallback(() => {
     socketRef.current?.disconnect()
-    typing.clearAll()
+    socketRef.current = null
+    encryptionService.logout()
+    vaultKeyRef.current = null
+    try { sessionStorage.removeItem('fc-vk') } catch { }
     setSession(null)
-    bootstrappedTokenRef.current = null
     setCurrentUser(null)
     setContacts([])
     setGroups([])
@@ -585,34 +832,41 @@ export function useChatConnection() {
     setMediaLibrary({})
     setErrors([])
     setStatus('disconnected')
-  }, [setSession, typing])
+  }, [setSession])
 
   const selectConversation = useCallback(
     async (conversation: ActiveConversation) => {
       setActiveConversation(conversation)
+      const t = session?.token
+      if (!t) return
 
-      if (conversation.type === 'group' && token) {
+      if (conversation.type === 'group') {
         const existingState = groupMessages[conversation.group.roomId]
         if (!existingState || !existingState.hasLoadedInitial) {
-          await ensureGroupHistory(conversation.group.roomId, token)
+          await ensureGroupHistory(conversation.group.roomId, t)
         }
-      } else if (conversation.type === 'direct' && token) {
+      } else if (conversation.type === 'direct') {
         const existingState = directMessages[conversation.contact.id]
         if (!existingState || !existingState.hasLoadedInitial) {
-          await ensureDirectHistory(conversation.contact.id, token)
+          await ensureDirectHistory(conversation.contact.id, t)
+        }
+        try {
+          const bundle = await fetchUserEncryptionBundle(conversation.contact.id, t)
+          await encryptionService.preEstablishSession(conversation.contact.id, bundle)
+        } catch (e) {
+          console.warn('[E2EE] Pre-fetch failed:', e)
         }
       }
     },
-    [directMessages, ensureDirectHistory, ensureGroupHistory, token],
+    [directMessages, ensureDirectHistory, ensureGroupHistory, session?.token, groupMessages],
   )
 
   const sendTextMessage = useCallback(
     async (text: string) => {
-      if (!currentUser) throw new Error('You must be logged in to send a message.')
+      if (!currentUser || !session?.token || !activeConversation) return
 
       const trimmedText = text.trim()
-      if (!trimmedText) throw new Error('Type a message before sending.')
-      if (!activeConversation) throw new Error('Select a conversation first.')
+      if (!trimmedText) return
 
       let finalMessage: ChatMessage = {
         senderId: currentUser.username,
@@ -624,62 +878,62 @@ export function useChatConnection() {
         timestamp: new Date().toISOString(),
       }
 
-      /* 
-      if (activeConversation.type === 'direct' && token) {
+      if (activeConversation.type === 'direct') {
         try {
-          let bundle = await fetchUserEncryptionBundle(activeConversation.contact.id, token)
-          const encryptedData = await encryptionService.encryptMessage(activeConversation.contact.id, trimmedText, bundle)
+          const bundle = await fetchUserEncryptionBundle(activeConversation.contact.id, session.token)
+          const encryptedData = await encryptionService.encryptMessage(
+            activeConversation.contact.id, trimmedText, bundle
+          )
           finalMessage.isEncrypted = true
           finalMessage.content = encryptedData.body
           finalMessage.encryptionMetadata = encryptedData
         } catch (e) {
-          console.error('Encryption failed:', e)
+          console.error('[E2EE] Encryption failed:', e)
         }
-      } else if (activeConversation.type === 'group' && token) {
+      } else if (activeConversation.type === 'group') {
         try {
-          const members = activeConversation.group.members || []
-          const encryptedGroupData = await groupEncryptionService.encryptGroupMessage(activeConversation.group.roomId, members, trimmedText);
+          const members = activeConversation.group.members ?? []
+          const encryptedGroupData = await groupEncryptionService.encryptGroupMessage(
+            activeConversation.group.roomId, members, trimmedText
+          )
           finalMessage = { ...finalMessage, ...encryptedGroupData }
         } catch (e) {
-          console.error('Group encryption failed:', e)
+          console.error('[E2EE] Group encryption failed:', e)
         }
       }
-      */
+
+      const fingerprint = getMessageFingerprint(finalMessage)
+      if (!Array.isArray(vaultSyncQueueRef.current)) vaultSyncQueueRef.current = []
+      vaultSyncQueueRef.current.push({
+        timestamp: new Date(finalMessage.timestamp!).getTime(),
+        fingerprint,
+        content: trimmedText
+      })
 
       sendSocketMessage(finalMessage)
       appendIncomingMessage({ ...finalMessage, content: trimmedText, isEncrypted: false })
     },
-    [activeConversation, appendIncomingMessage, currentUser, sendSocketMessage, token],
+    [activeConversation, appendIncomingMessage, currentUser, sendSocketMessage, session?.token],
   )
 
   const sendMediaMessage = useCallback(
     async (file: File) => {
-      if (!currentUser || !token) throw new Error('Not logged in.')
-      if (!activeConversation) throw new Error('Select a conversation first.')
-
+      if (!currentUser || !session?.token || !activeConversation) return
       setUploading(true)
       try {
         let fileToUpload: File | Blob = file
-        // let encryptionKeys: { key: string; iv: string } | undefined = undefined
-
         if (activeConversation.type === 'direct') {
           try {
             const encryptedData = await encryptionService.encryptFile(file)
             fileToUpload = encryptedData.encryptedBlob
-            // encryptionKeys = { key: encryptedData.key, iv: encryptedData.iv }
           } catch (e) {
             console.error('File encryption failed:', e)
           }
         }
 
-        const uploaded = await uploadMedia(fileToUpload as File, token)
+        const uploaded = await uploadMedia(fileToUpload as File, session.token)
         setMediaLibrary((current) => ({ ...current, [uploaded.id]: uploaded }))
 
-        /* 
-        if (activeConversation.type === 'direct') {
-          // File encryption skip
-        }
-        */
         const finalMessage: ChatMessage = {
           senderId: currentUser.username,
           senderName: currentUser.displayName,
@@ -690,31 +944,15 @@ export function useChatConnection() {
           timestamp: new Date().toISOString(),
         }
 
-        /* 
-        if (activeConversation.type === 'direct' && encryptionKeys) {
-          try {
-            let bundle = await fetchUserEncryptionBundle(activeConversation.contact.id, token)
-            const metadataStr = JSON.stringify(encryptionKeys)
-            const encryptedMetadata = await encryptionService.encryptMessage(activeConversation.contact.id, metadataStr, bundle)
-            finalMessage.isEncrypted = true
-            finalMessage.content = encryptedMetadata.body
-            finalMessage.encryptionMetadata = encryptedMetadata
-          } catch (e) {
-            console.error('Signal encryption of media keys failed:', e)
-          }
-        }
-        */
-
         sendSocketMessage(finalMessage)
         appendIncomingMessage({ ...finalMessage, isEncrypted: false })
       } catch (error) {
         pushError('rest', 'Unable to upload file.')
-        throw error
       } finally {
         setUploading(false)
       }
     },
-    [activeConversation, appendIncomingMessage, currentUser, pushError, sendSocketMessage, token],
+    [activeConversation, appendIncomingMessage, currentUser, pushError, sendSocketMessage, session?.token],
   )
 
   const notifyTyping = useCallback(() => {
@@ -727,57 +965,57 @@ export function useChatConnection() {
   }, [activeConversation, status, typing])
 
   const addContact = useCallback(async (username: string) => {
-    if (!token) throw new Error('Not logged in')
-    await apiAddContact(username, token)
-    const updatedContacts = await fetchContacts(token)
+    if (!session?.token) return
+    await apiAddContact(username, session.token)
+    const updatedContacts = await fetchContacts(session.token)
     setContacts(normalizeContacts(updatedContacts))
-  }, [token])
+  }, [session?.token])
 
   const removeContact = useCallback(async (username: string) => {
-    if (!token) throw new Error('Not logged in')
-    await apiRemoveContact(username, token)
+    if (!session?.token) return
+    await apiRemoveContact(username, session.token)
     setContacts((current) => current.filter((c) => c.id !== username))
     if (activeConversation?.type === 'direct' && activeConversation.contact.id === username) setActiveConversation(null)
-  }, [activeConversation, token])
+  }, [activeConversation, session?.token])
 
   const deleteGroupAction = useCallback(async (groupId: number) => {
-    if (!token) throw new Error('Not logged in')
-    await apiDeleteGroup(groupId, token)
+    if (!session?.token) return
+    await apiDeleteGroup(groupId, session.token)
     setGroups((current) => current.filter((g) => g.id !== groupId))
     if (activeConversation?.type === 'group' && activeConversation.group.id === groupId) setActiveConversation(null)
-  }, [activeConversation, token])
+  }, [activeConversation, session?.token])
 
   const updateProfilePicture = useCallback(async (file: File) => {
-    if (!token) throw new Error('Not logged in')
+    if (!session?.token) return
     setUploading(true)
     try {
-      await apiUploadProfilePicture(file, token)
-      const updatedUser = await fetchAuthenticatedUser(token)
+      await apiUploadProfilePicture(file, session.token)
+      const updatedUser = await fetchAuthenticatedUser(session.token)
       setCurrentUser(updatedUser)
     } finally {
       setUploading(false)
     }
-  }, [token])
+  }, [session?.token])
 
   const createGroup = useCallback(async (name: string, description: string, members: string[]) => {
-    if (!token) throw new Error('Not logged in')
-    const newGroup = await apiCreateGroup({ name, description, members }, token)
-    const updatedGroups = await fetchGroups(token)
+    if (!session?.token) return
+    const newGroup = await apiCreateGroup({ name, description, members }, session.token)
+    const updatedGroups = await fetchGroups(session.token)
     setGroups(updatedGroups)
     return newGroup
-  }, [token])
+  }, [session?.token])
 
   const updateProfile = useCallback(async (displayName: string, about: string) => {
-    if (!token) throw new Error('Not logged in')
+    if (!session?.token) return
     setUploading(true)
     try {
-      const updated = await apiUpdateProfile({ displayName, about }, token)
+      const updated = await apiUpdateProfile({ displayName, about }, session.token)
       setCurrentUser(updated)
       setSession((current) => current ? { ...current, user: updated } : null)
     } finally {
       setUploading(false)
     }
-  }, [token, setSession])
+  }, [session?.token, setSession])
 
   useEffect(() => { restoreSessionRef.current = session }, [session])
 
@@ -815,7 +1053,7 @@ export function useChatConnection() {
   }
 
   return {
-    token,
+    token: session?.token ?? '',
     currentUser,
     isAuthenticated: Boolean(session?.token && currentUser),
     isBootstrapping,
@@ -840,7 +1078,6 @@ export function useChatConnection() {
     removeContact,
     deleteGroup: deleteGroupAction,
     updateProfile,
-    resetEncryption,
     updateProfilePicture,
     createGroup,
     loadMoreHistory,
