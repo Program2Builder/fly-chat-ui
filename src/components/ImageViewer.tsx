@@ -10,12 +10,11 @@ interface ImageViewerProps {
   fallbackText?: string
   alt?: string
   onClose: () => void
-  encryptionKeys?: { key: string; iv: string }
 }
 
-export function ImageViewer({ open, imageUrl, fallbackText, alt, onClose, encryptionKeys }: ImageViewerProps) {
+export function ImageViewer({ open, imageUrl, fallbackText, alt, onClose }: ImageViewerProps) {
   const { token } = useChat()
-  const { src: authSrc, loading } = useAuthenticatedImage(open ? imageUrl : null, token, encryptionKeys)
+  const { src: authSrc, loading } = useAuthenticatedImage(open ? imageUrl : null, token)
 
   return (
     <Modal

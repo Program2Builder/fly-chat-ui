@@ -1,5 +1,4 @@
 import ForumRoundedIcon from '@mui/icons-material/ForumRounded'
-import LockRoundedIcon from '@mui/icons-material/LockRounded'
 import LogoutRoundedIcon from '@mui/icons-material/LogoutRounded'
 import MoreVertRoundedIcon from '@mui/icons-material/MoreVertRounded'
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
@@ -32,6 +31,7 @@ import { ConfirmationDialog } from './ConfirmationDialog'
 import { ProfileDrawer } from './ProfileDrawer'
 import { CreateGroupDialog } from './CreateGroupDialog'
 import { AuthenticatedAvatar } from './AuthenticatedAvatar'
+import { ProfilePicViewer } from './ProfilePicViewer'
 
 const SIDEBAR_W = 320
 
@@ -59,6 +59,7 @@ export function ChatShell({ onGoHome, onGoLogin }: ChatShellProps) {
 
   const [toastMessage, setToastMessage] = useState<string | null>(null)
   const [toastSeverity, setToastSeverity] = useState<'success' | 'error'>('success')
+  const [picViewer, setPicViewer] = useState<{ relativeUrl?: string | null; displayName?: string; subtitle?: string } | null>(null)
 
   const showToast = (message: string, severity: 'success' | 'error' = 'success') => {
     setToastMessage(message)
@@ -133,10 +134,13 @@ export function ChatShell({ onGoHome, onGoLogin }: ChatShellProps) {
       }}>
         {/* Current user avatar */}
         <Tooltip title="Your profile">
-          <Box onClick={() => setIsProfileOpen(true)} sx={{ cursor: 'pointer', flexShrink: 0 }}>
+          <Box
+            onClick={() => setIsProfileOpen(true)}
+            sx={{ cursor: 'pointer', flexShrink: 0 }}
+          >
             <AuthenticatedAvatar
               relativeUrl={chat.currentUser?.profilePictureUrl}
-              sx={{ width: 38, height: 38, bgcolor: '#00a884', fontSize: '1rem', fontWeight: 700 }}
+              sx={{ width: 38, height: 38, bgcolor: 'transparent', fontSize: '1rem', fontWeight: 700 }}
             >
               {chat.currentUser?.displayName?.[0]?.toUpperCase() || 'F'}
             </AuthenticatedAvatar>
@@ -253,17 +257,22 @@ export function ChatShell({ onGoHome, onGoLogin }: ChatShellProps) {
             <>
               {/* Conversation avatar */}
               {chat.activeConversation.type === 'direct' ? (
-                <AuthenticatedAvatar
-                  relativeUrl={chat.activeConversation.contact.profilePictureUrl}
-                  alt={chat.activeConversation.contact.displayName}
-                  sx={{
-                    width: 40, height: 40, flexShrink: 0,
-                    bgcolor: '#00a884', fontSize: '1rem', fontWeight: 700,
-                    boxShadow: '0 2px 10px rgba(0,0,0,0.3)',
-                  }}
+                <Box
+                  onClick={() => setPicViewer({
+                    relativeUrl: chat.activeConversation!.type === 'direct' ? chat.activeConversation!.contact.profilePictureUrl : null,
+                    displayName: chat.activeConversation!.type === 'direct' ? chat.activeConversation!.contact.displayName : undefined,
+                    subtitle: chat.activeConversation!.type === 'direct' ? `@${chat.activeConversation!.contact.id}` : undefined,
+                  })}
+                  sx={{ cursor: 'pointer', flexShrink: 0 }}
                 >
-                  {(chat.activeConversation.contact.displayName?.[0] || 'C').toUpperCase()}
-                </AuthenticatedAvatar>
+                  <AuthenticatedAvatar
+                    alt={chat.activeConversation.contact.displayName}
+                    relativeUrl={chat.activeConversation.contact.profilePictureUrl}
+                    sx={{ width: 40, height: 40, flexShrink: 0, bgcolor: 'transparent' }}
+                  >
+                    {(chat.activeConversation.contact.displayName?.[0] || 'C').toUpperCase()}
+                  </AuthenticatedAvatar>
+                </Box>
               ) : (
                 <Box sx={{ width: 40, height: 40, borderRadius: '50%', bgcolor: '#005c4b', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: '0 2px 10px rgba(0,0,0,0.3)' }}>
                   <ForumRoundedIcon sx={{ fontSize: '1.3rem', color: '#e9edef' }} />
@@ -272,14 +281,9 @@ export function ChatShell({ onGoHome, onGoLogin }: ChatShellProps) {
 
               {/* Name + subtitle */}
               <Box sx={{ flex: 1, minWidth: 0 }}>
-                <Stack direction="row" alignItems="center" spacing={0.5}>
-                  <Typography variant="subtitle1" noWrap sx={{ fontWeight: 700, color: '#e9edef', fontSize: '0.95rem', lineHeight: 1.2 }}>
-                    {conversationTitle}
-                  </Typography>
-                  <Tooltip title="End-to-End Encrypted">
-                    <LockRoundedIcon sx={{ fontSize: '0.8rem', color: '#00a884', opacity: 0.8, flexShrink: 0 }} />
-                  </Tooltip>
-                </Stack>
+                <Typography variant="subtitle1" noWrap sx={{ fontWeight: 700, color: '#e9edef', fontSize: '0.95rem', lineHeight: 1.2 }}>
+                  {conversationTitle}
+                </Typography>
                 <Typography variant="caption" sx={{
                   fontSize: '0.75rem',
                   color: chat.activeTypingNames.length > 0 ? '#00a884' : '#8696a0',
@@ -359,6 +363,8 @@ export function ChatShell({ onGoHome, onGoLogin }: ChatShellProps) {
               onLoadMore={chat.loadMoreHistory}
               isLoadingMore={chat.isLoadingMore}
               hasNextPage={chat.hasNextPage}
+              isGroup={chat.activeConversation.type === 'group'}
+              contacts={chat.contacts}
             />
           ) : (
             /* Empty state */
@@ -387,19 +393,6 @@ export function ChatShell({ onGoHome, onGoLogin }: ChatShellProps) {
                 </Typography>
               </Box>
 
-              {/* E2EE badge */}
-              <Box sx={{
-                display: 'flex', alignItems: 'center', gap: 0.75,
-                px: 2, py: 0.75,
-                bgcolor: 'rgba(0,168,132,0.08)',
-                border: '1px solid rgba(0,168,132,0.18)',
-                borderRadius: '20px',
-              }}>
-                <LockRoundedIcon sx={{ fontSize: '0.9rem', color: '#00a884' }} />
-                <Typography variant="caption" sx={{ color: '#00a884', fontWeight: 600, fontSize: '0.75rem' }}>
-                  All messages are end-to-end encrypted
-                </Typography>
-              </Box>
             </Box>
           )}
         </Box>
@@ -424,7 +417,7 @@ export function ChatShell({ onGoHome, onGoLogin }: ChatShellProps) {
         onClose={() => setIsProfileOpen(false)}
         onUpdateProfilePicture={chat.updateProfilePicture}
         onUpdateProfile={chat.updateProfile}
-        onResetEncryption={chat.resetEncryption}
+        onClearAppCache={chat.clearAppStorage}
       />
 
       <AddContactDialog
@@ -475,6 +468,14 @@ export function ChatShell({ onGoHome, onGoLogin }: ChatShellProps) {
           {toastMessage}
         </Alert>
       </Snackbar>
+
+      <ProfilePicViewer
+        open={Boolean(picViewer)}
+        onClose={() => setPicViewer(null)}
+        relativeUrl={picViewer?.relativeUrl}
+        displayName={picViewer?.displayName}
+        subtitle={picViewer?.subtitle}
+      />
     </Box>
   )
 }

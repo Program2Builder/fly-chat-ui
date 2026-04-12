@@ -11,6 +11,7 @@ import {
   TextField,
   InputAdornment,
   Button,
+  Divider,
 } from '@mui/material'
 import ArrowBackRoundedIcon from '@mui/icons-material/ArrowBackRounded'
 import PersonRoundedIcon from '@mui/icons-material/PersonRounded'
@@ -18,9 +19,13 @@ import PhotoCameraRoundedIcon from '@mui/icons-material/PhotoCameraRounded'
 import EditRoundedIcon from '@mui/icons-material/EditRounded'
 import CheckRoundedIcon from '@mui/icons-material/CheckRounded'
 import CloseRoundedIcon from '@mui/icons-material/CloseRounded'
+import SyncRoundedIcon from '@mui/icons-material/SyncRounded'
+import HistoryRoundedIcon from '@mui/icons-material/HistoryRounded'
+import WarningRoundedIcon from '@mui/icons-material/WarningRounded'
 import type { AuthUser } from '../types/chat'
 import { useState, useRef, useEffect } from 'react'
 import { ImageViewer } from './ImageViewer'
+import { ProfilePicViewer } from './ProfilePicViewer'
 import { getAvatarUrl } from '../utils/chatUtils'
 import { useAuthenticatedImage } from '../hooks/useAuthenticatedImage'
 import { useChat } from '../context/ChatContext'
@@ -31,23 +36,20 @@ interface ProfileDrawerProps {
   onClose: () => void
   onUpdateProfilePicture?: (file: File) => Promise<void>
   onUpdateProfile?: (displayName: string, about: string) => Promise<void>
-  onResetEncryption?: () => Promise<void>
+  onClearAppCache?: () => Promise<void>
 }
-
 export function ProfileDrawer({ 
   open, 
   user, 
   onClose, 
   onUpdateProfilePicture,
   onUpdateProfile,
-  onResetEncryption 
+  onClearAppCache
 }: ProfileDrawerProps) {
+
   const { token } = useChat()
   const [imageViewerOpen, setImageViewerOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
-  const [resetLoading, setResetLoading] = useState(false)
-  const [resetStatus, setResetStatus] = useState<'idle' | 'success' | 'error'>('idle')
-  const [resetError, setResetError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Profile Edit State
@@ -68,9 +70,6 @@ export function ProfileDrawer({
     token
   )
 
-  if (!user) return null
-
-  const fallbackText = user.displayName?.[0]?.toUpperCase()
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -87,7 +86,7 @@ export function ProfileDrawer({
   }
 
   const handleAvatarClick = () => {
-    if (user.profilePictureUrl) {
+    if (user?.profilePictureUrl) {
       setImageViewerOpen(true)
     } else {
       fileInputRef.current?.click()
@@ -95,7 +94,7 @@ export function ProfileDrawer({
   }
 
   const handleSaveName = async () => {
-    if (!onUpdateProfile || editName === user.displayName) {
+    if (!onUpdateProfile || !user || editName === user.displayName) {
       setIsEditingName(false)
       return
     }
@@ -109,7 +108,7 @@ export function ProfileDrawer({
   }
 
   const handleSaveAbout = async () => {
-    if (!onUpdateProfile || editAbout === user.about) {
+    if (!onUpdateProfile || !user || editAbout === user.about) {
       setIsEditingAbout(false)
       return
     }
@@ -122,32 +121,31 @@ export function ProfileDrawer({
     }
   }
 
-  const handleResetEncryption = async () => {
-    if (!onResetEncryption) return
+
+  const handleClearData = async () => {
+    if (!onClearAppCache) return
     if (!window.confirm(
-      'Reset your E2EE keys?\n\n'
-      + '• Your local keys will be wiped and regenerated.\n'
-      + '• New keys will be uploaded to the server.\n'
-      + '• Contacts must re-open chat to re-establish sessions.'
+      '⚠️ ABSOLUTE HARD RESET ⚠️\n\n'
+      + 'This will permanently delete:\n'
+      + '• ALL locally cached messages\n'
+      + '• Your login session\n\n'
+      + 'You will be logged out and all locally stored chat history will be lost. Continue?'
     )) {
       return
     }
 
-    setResetLoading(true)
-    setResetStatus('idle')
-    setResetError(null)
     try {
-      await onResetEncryption()
-      setResetStatus('success')
+      await onClearAppCache()
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      console.error('[E2EE] resetEncryption failed:', err)
-      setResetStatus('error')
-      setResetError(msg)
-    } finally {
-      setResetLoading(false)
+      console.error('Failed to clear app cache:', err)
+      alert('Failed to clear application data. See console for details.')
     }
   }
+
+
+  if (!user) return null
+
+  const fallbackText = user.displayName?.[0]?.toUpperCase()
 
   return (
     <>
@@ -373,61 +371,40 @@ export function ProfileDrawer({
               </Typography>
             </Box>
 
-            <Box sx={{ width: '100%', bgcolor: '#111b21', p: 3, mb: 4, boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
-              <Typography variant="body2" color="#ea4335" sx={{ mb: 1.5, fontWeight: 500 }}>
-                Security & Privacy
+
+            <Box sx={{ width: '100%', bgcolor: '#111b21', p: 3, mb: 1, boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+              <Typography variant="body2" sx={{ color: '#ea4335', mb: 1.5, fontWeight: 500 }}>
+                Dangerous Actions
               </Typography>
               <Typography variant="caption" sx={{ color: '#8696a0', display: 'block', mb: 2 }}>
-                If you are having trouble decrypting messages, you can reset your encryption state. This will regenerate your keys and clear all current sessions.
+                Clears all local storage and message cache. You will be logged out and local messages will be deleted.
               </Typography>
               <Button 
-                variant="outlined" 
+                variant="contained" 
                 color="error" 
                 fullWidth 
-                onClick={handleResetEncryption}
-                disabled={resetLoading}
-                startIcon={resetLoading ? <CircularProgress size={20} color="inherit" /> : null}
+                onClick={handleClearData}
                 sx={{ 
                   textTransform: 'none', 
                   borderRadius: '20px',
-                  borderColor: alpha('#ea4335', 0.3),
-                  '&:hover': {
-                    borderColor: '#ea4335',
-                    bgcolor: alpha('#ea4335', 0.05)
-                  }
+                  fontWeight: 600,
+                  bgcolor: '#ea4335',
+                  '&:hover': { bgcolor: '#d32f2f' }
                 }}
               >
-                {resetLoading ? 'Resetting…' : 'Reset End-to-End Encryption'}
+                Reset Application Data
               </Button>
-
-              {/* Feedback below the button */}
-              {resetStatus === 'success' && (
-                <Box sx={{ mt: 1.5, p: 1.5, borderRadius: '10px', bgcolor: 'rgba(0,168,132,0.1)', border: '1px solid rgba(0,168,132,0.3)' }}>
-                  <Typography variant="caption" sx={{ color: '#00a884', fontWeight: 600 }}>
-                    ✅ Keys reset & uploaded successfully. Contacts must re-open the chat to re-establish secure sessions.
-                  </Typography>
-                </Box>
-              )}
-              {resetStatus === 'error' && resetError && (
-                <Box sx={{ mt: 1.5, p: 1.5, borderRadius: '10px', bgcolor: 'rgba(234,67,53,0.1)', border: '1px solid rgba(234,67,53,0.3)' }}>
-                  <Typography variant="caption" sx={{ color: '#ea4335', fontWeight: 600 }}>
-                    ❌ Reset failed: {resetError}
-                  </Typography>
-                  <Typography variant="caption" sx={{ display: 'block', color: '#8696a0', mt: 0.5 }}>
-                    Check the DevTools Console (F12) for details.
-                  </Typography>
-                </Box>
-              )}
             </Box>
           </Stack>
         </Box>
       </Drawer>
 
-      <ImageViewer 
-        open={imageViewerOpen} 
-        onClose={() => setImageViewerOpen(false)} 
-        imageUrl={getAvatarUrl(user.profilePictureUrl)}
-        fallbackText={fallbackText} 
+      <ProfilePicViewer
+        open={imageViewerOpen}
+        onClose={() => setImageViewerOpen(false)}
+        relativeUrl={user.profilePictureUrl}
+        displayName={user.displayName || user.username}
+        subtitle={`@${user.username}`}
       />
     </>
   )

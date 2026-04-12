@@ -106,6 +106,17 @@ export class ChatSocket {
     })
   }
 
+  publishStatus(messageId: string, status: 'SENT' | 'DELIVERED' | 'READ') {
+    if (!this.client?.connected) {
+      throw new Error('Not connected')
+    }
+
+    this.client.publish({
+      destination: '/app/chat.status',
+      body: JSON.stringify({ messageId, status }),
+    })
+  }
+
   isConnected() {
     return this.client?.connected ?? false
   }

@@ -1,7 +1,6 @@
 import GroupsRoundedIcon from '@mui/icons-material/GroupsRounded'
 import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded'
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded'
-import LockRoundedIcon from '@mui/icons-material/LockRounded'
 import { alpha } from '@mui/material/styles'
 import {
   Avatar,
@@ -79,7 +78,8 @@ export function DirectMessagePanel({
       </Box>
 
       {/* ── Scrollable list ── */}
-      <Box sx={{ flex: 1, overflowY: 'auto', minHeight: 0,
+      <Box sx={{
+        flex: 1, overflowY: 'auto', minHeight: 0,
         '&::-webkit-scrollbar': { width: '4px' },
         '&::-webkit-scrollbar-thumb': { bgcolor: 'rgba(255,255,255,0.12)', borderRadius: '4px' },
         '&::-webkit-scrollbar-track': { bgcolor: 'transparent' },
@@ -143,7 +143,6 @@ export function DirectMessagePanel({
                     </Typography>
                   </Box>
 
-                  <LockRoundedIcon sx={{ fontSize: '0.75rem', color: '#00a884', opacity: 0.7, flexShrink: 0 }} />
                 </Stack>
               )
             })}
@@ -198,18 +197,18 @@ export function DirectMessagePanel({
                       position: 'relative',
                     }}
                   >
-                    {selected && (
+                    {/* {selected && (
                       <Box sx={{ position: 'absolute', left: 0, top: '20%', bottom: '20%', width: '3px', borderRadius: '0 3px 3px 0', bgcolor: '#00a884' }} />
-                    )}
+                    )} */}
 
                     <AuthenticatedAvatar
                       relativeUrl={contact.profilePictureUrl}
                       alt={contact.displayName}
                       sx={{
                         width: 46, height: 46,
-                        bgcolor: stringToColor(contact.id),
+                        bgcolor: 'transparent',
                         fontSize: '1rem', fontWeight: 700,
-                        boxShadow: selected ? '0 0 0 2px #00a884' : 'none',
+                        // boxShadow: selected ? '0 0 0 2px #00a884' : 'none',
                         transition: 'box-shadow 0.15s',
                         flexShrink: 0,
                       }}
@@ -227,7 +226,6 @@ export function DirectMessagePanel({
                     </Box>
 
                     <Stack direction="row" alignItems="center" spacing={0.5} sx={{ flexShrink: 0 }}>
-                      <LockRoundedIcon sx={{ fontSize: '0.75rem', color: '#00a884', opacity: 0.7 }} />
                       {onRemoveContact && (
                         <Tooltip title="Remove Contact">
                           <IconButton

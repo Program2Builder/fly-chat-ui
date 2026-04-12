@@ -1,5 +1,4 @@
 import { useState, useEffect } from 'react'
-import { encryptionService } from '../services/EncryptionService'
 
 /**
  * A hook that fetches an image from an authenticated endpoint using a Blob and Object URL.
@@ -7,8 +6,7 @@ import { encryptionService } from '../services/EncryptionService'
  */
 export function useAuthenticatedImage(
   url: string | null | undefined, 
-  token: string | null,
-  encryptionKeys?: { key: string; iv: string }
+  token: string | null
 ) {
   const [src, setSrc] = useState<string | undefined>(undefined)
   const [loading, setLoading] = useState(false)
@@ -37,17 +35,7 @@ export function useAuthenticatedImage(
           throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`)
         }
 
-        let blob = await response.blob()
-
-        // Decrypt if keys are provided
-        if (encryptionKeys) {
-          try {
-            blob = await encryptionService.decryptFile(blob, encryptionKeys.key, encryptionKeys.iv)
-          } catch (decryptErr) {
-            console.error('Failed to decrypt image blob:', decryptErr)
-            throw new Error('Failed to decrypt secure image.')
-          }
-        }
+        const blob = await response.blob()
 
         if (isMounted) {
           objectUrl = URL.createObjectURL(blob)

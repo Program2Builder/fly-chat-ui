@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { SignalProtocolAddress } from '@privacyresearch/libsignal-protocol-typescript'
 import { fetchAuthenticatedUser, loginUser } from '../api/authApi'
 import {
   fetchBootstrap,
@@ -13,14 +12,8 @@ import {
   deleteGroup as apiDeleteGroup,
   uploadProfilePicture as apiUploadProfilePicture,
   apiCreateGroup,
-  uploadEncryptionKeys,
-  fetchUserEncryptionBundle,
   updateProfile as apiUpdateProfile,
 } from '../api/chatApi'
-import { encryptionService, groupEncryptionService } from '../services/EncryptionService'
-import { cachePlaintext, getCachedPlaintext, setCacheUser } from '../services/MessagePlaintextCache'
-import { vaultApi } from '../api/vaultApi'
-import { deriveVaultKey, encryptForVault, decryptFromVault } from '../services/vaultCrypto'
 import type {
   ActiveConversation,
   AuthSession,
@@ -35,17 +28,6 @@ import type {
 import { ChatSocket } from '../websocket/chatSocket'
 import { useLocalStorage } from './useLocalStorage'
 import { useTypingIndicator } from './useTypingIndicator'
-
-function getMessageFingerprint(message: ChatMessage) {
-  return [
-    message.type,
-    message.senderId,
-    message.roomId ?? '',
-    [...(message.recipients ?? [])].sort().join(','),
-    message.content ?? '',
-    message.mediaId ?? '',
-  ].join('|')
-}
 
 function getMessageKey(message: ChatMessage) {
   if (message.id) {
@@ -79,7 +61,6 @@ function dedupeAndSort(messages: ChatMessage[]) {
 }
 
 function appendMessageWithLiveMerge(messages: ChatMessage[], incoming: ChatMessage) {
-  const incomingFingerprint = getMessageFingerprint(incoming)
   const incomingTime = incoming.timestamp ? new Date(incoming.timestamp).getTime() : 0
 
   const merged = [...messages]
@@ -87,14 +68,13 @@ function appendMessageWithLiveMerge(messages: ChatMessage[], incoming: ChatMessa
     if (incoming.id && message.id === incoming.id) {
       return true
     }
-
-    const sameFingerprint = getMessageFingerprint(message) === incomingFingerprint
-    if (!sameFingerprint) {
-      return false
-    }
-
-    const existingTime = message.timestamp ? new Date(message.timestamp).getTime() : 0
-    return Math.abs(existingTime - incomingTime) < 15000
+    // Simple fingerprinting fallback if IDs are missing
+    return (
+      message.senderId === incoming.senderId &&
+      message.type === incoming.type &&
+      message.content === incoming.content &&
+      Math.abs((message.timestamp ? new Date(message.timestamp).getTime() : 0) - incomingTime) < 15000
+    )
   })
 
   if (existingIndex >= 0) {
@@ -109,43 +89,6 @@ function appendMessageWithLiveMerge(messages: ChatMessage[], incoming: ChatMessa
   return merged
 }
 
-async function syncEntireVaultToCache(token: string, vaultKey: CryptoKey | null) {
-  if (!vaultKey) return
-  
-  console.group('[Vault] 🔄 Synchronization start')
-  let currentPage = 0
-  let totalRestored = 0
-  
-  try {
-    while (true) {
-      console.debug(`[Vault] Fetching page ${currentPage}...`)
-      const page = await vaultApi.fetchAll(token, currentPage, 50)
-      
-      if (page.entries.length > 0) {
-        await Promise.all(page.entries.map(async (item: any) => {
-          try {
-            const plaintext = await decryptFromVault(item.ciphertext, vaultKey)
-            if (plaintext) {
-              await cachePlaintext(item.messageId, plaintext)
-              totalRestored++
-            }
-          } catch (e) {
-            console.warn(`[Vault] Failed to decrypt entry ${item.messageId}:`, e)
-          }
-        }))
-      }
-      
-      if (!page.hasMore || page.entries.length === 0) break
-      currentPage++
-    }
-    console.log(`[Vault] ✅ Sync complete. Restored ${totalRestored} entries into cache.`)
-  } catch (error) {
-    console.error('[Vault] ❌ Synchronization failed:', error)
-  } finally {
-    console.groupEnd()
-  }
-}
-
 function normalizeContacts(contacts: ChatContact[]) {
   return [...contacts].sort((left, right) => {
     const leftTime = left.lastInteractionAt ? new Date(left.lastInteractionAt).getTime() : 0
@@ -155,6 +98,8 @@ function normalizeContacts(contacts: ChatContact[]) {
 }
 
 function getDirectConversationKey(message: ChatMessage, currentUsername: string) {
+  if (message.roomId) return message.roomId
+
   if (message.senderId === currentUsername) {
     return message.recipients?.[0] ?? ''
   }
@@ -166,34 +111,24 @@ export function useChatConnection() {
   const socketRef = useRef<ChatSocket | null>(null)
   const restoreSessionRef = useRef<AuthSession | null>(null)
   const bootstrappedTokenRef = useRef<string | null>(null)
-  
-  /**
-   * The zero-knowledge vault key. 
-   * Lives ONLY in memory and sessionStorage (for refresh survival).
-   */
-  const vaultKeyRef = useRef<CryptoKey | null>(null)
-  
-  /**
-   * Temporary store for outgoing messages awaiting server echo.
-   * We use a ref here to ensure the data is never stale in socket callbacks.
-   */
-  const vaultSyncQueueRef = useRef<Array<{
-    timestamp: number;
-    fingerprint: string;
-    content: string;
-  }>>([])
-  
+
   const [session, setSession] = useLocalStorage<AuthSession | null>('flychat-auth-session', null)
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(session?.user ?? null)
-  // Always-fresh ref — updated in sync with state but readable in stale closures
   const currentUserRef = useRef<AuthUser | null>(session?.user ?? null)
+  const tokenRef = useRef<string>(session?.token ?? '')
+
   const [status, setStatus] = useState<ConnectionStatus>('disconnected')
   const [errors, setErrors] = useState<ChatError[]>([])
   const [isBootstrapping, setIsBootstrapping] = useState(Boolean(session?.token))
   const [contacts, setContacts] = useState<ChatContact[]>([])
   const [groups, setGroups] = useState<ChatGroup[]>([])
   const [activeConversation, setActiveConversation] = useState<ActiveConversation | null>(null)
-  
+  const activeConversationRef = useRef<ActiveConversation | null>(null)
+
+  useEffect(() => {
+    activeConversationRef.current = activeConversation
+  }, [activeConversation])
+
   interface ConversationState {
     messages: ChatMessage[]
     hasNext: boolean
@@ -207,8 +142,6 @@ export function useChatConnection() {
   const [uploading, setUploading] = useState(false)
   const [mediaLibrary, setMediaLibrary] = useState<Record<string, MediaUploadResponse>>({})
 
-  const token = session?.token ?? ''
-
   const pushError = useCallback((source: ChatError['source'], message: string) => {
     setErrors((current) => [{ source, message }, ...current].slice(0, 6))
   }, [])
@@ -219,62 +152,25 @@ export function useChatConnection() {
     if (!socketRef.current?.isConnected()) {
       throw new Error('Connect to the chat server first.')
     }
-
     socketRef.current.publish(message)
   }, [])
 
-  // Keep the ref in sync with the state so all callbacks always see the live user
-  useEffect(() => { currentUserRef.current = currentUser }, [currentUser])
-
-  /**
-   * Fire-and-forget: encrypt `plaintext` with the vault key and store to server.
-   * Silently skips if vault key is unavailable (page refresh without password).
-   * Never throws — failures are logged only.
-   */
-  const encryptAndStoreToVault = useCallback(
-    (messageId: string | undefined, plaintext: string) => {
-      const vk = vaultKeyRef.current
-      if (!messageId || !token || !vk) return
-      encryptForVault(plaintext, vk)
-        .then((ciphertext) => vaultApi.store(messageId, ciphertext, token))
-        .catch((err) => console.debug('[Vault] Store skipped/failed:', err?.message))
-    },
-    [token],
-  )
+  useEffect(() => {
+    currentUserRef.current = currentUser
+    tokenRef.current = session?.token ?? ''
+  }, [currentUser, session])
 
   const handleSendTyping = useCallback(
     (message: ChatMessage) => {
       try {
         sendSocketMessage(message)
       } catch (error) {
-        const readable =
-          error instanceof Error ? error.message : 'Failed to send typing event.'
+        const readable = error instanceof Error ? error.message : 'Failed to send typing event.'
         pushError('websocket', readable)
       }
     },
     [pushError, sendSocketMessage],
   )
-
-  /** Export key bytes → base64 → sessionStorage for refresh survival. */
-  const saveVaultKeyToSession = useCallback(async (key: CryptoKey) => {
-    try {
-      const raw = await window.crypto.subtle.exportKey('raw', key)
-      const b64 = btoa(String.fromCharCode(...new Uint8Array(raw)))
-      sessionStorage.setItem('fc-vk', b64)
-    } catch { /* sessionStorage unavailable */ }
-  }, [])
-
-  /** Restore key from sessionStorage if present. */
-  const restoreVaultKeyFromSession = useCallback(async () => {
-    try {
-      const raw = sessionStorage.getItem('fc-vk')
-      if (!raw) return null
-      const keyBytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0))
-      return await window.crypto.subtle.importKey(
-        'raw', keyBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
-      )
-    } catch { return null }
-  }, [])
 
   const typing = useTypingIndicator({
     userId: currentUser?.username ?? '',
@@ -284,18 +180,32 @@ export function useChatConnection() {
 
   const appendIncomingMessage = useCallback(
     (message: ChatMessage) => {
-      // Use the ref so this callback is never stale (called during bootstrap when
-      // currentUser state hasn't propagated yet)
       const user = currentUserRef.current
-      if (!user || message.type === 'TYPING') {
-        return
+      if (!user || message.type === 'TYPING') return
+
+      if (message.id && message.senderId !== user.username) {
+        const activeConv = activeConversationRef.current
+        const isGroupAndActive = message.roomId && activeConv?.type === 'group' && activeConv.group.roomId === message.roomId
+        const isDirectAndActive = !message.roomId && activeConv?.type === 'direct' && activeConv.contact.id === message.senderId
+
+        if (!message.status || message.status === 'SENT') {
+          if (isGroupAndActive || isDirectAndActive) {
+            socketRef.current?.publishStatus(message.id, 'READ')
+          } else {
+            socketRef.current?.publishStatus(message.id, 'DELIVERED')
+          }
+        } else if (message.status === 'DELIVERED') {
+          if (isGroupAndActive || isDirectAndActive) {
+            socketRef.current?.publishStatus(message.id, 'READ')
+          }
+        }
       }
 
       if (message.roomId) {
         setGroupMessages((current) => {
-          const state = current[message.roomId!] || { 
-            messages: [], 
-            hasNext: false, 
+          const state = current[message.roomId!] || {
+            messages: [],
+            hasNext: false,
             currentPage: 0,
             hasLoadedInitial: false
           }
@@ -311,14 +221,12 @@ export function useChatConnection() {
       }
 
       const conversationKey = getDirectConversationKey(message, user.username)
-      if (!conversationKey) {
-        return
-      }
+      if (!conversationKey) return
 
       setDirectMessages((current) => {
-        const state = current[conversationKey] || { 
-          messages: [], 
-          hasNext: false, 
+        const state = current[conversationKey] || {
+          messages: [],
+          hasNext: false,
           currentPage: 0,
           hasLoadedInitial: false
         }
@@ -331,45 +239,8 @@ export function useChatConnection() {
         }
       })
     },
-    [currentUser],
+    []
   )
-
-  const resetEncryption = useCallback(async (): Promise<void> => {
-    if (!token || !currentUser) {
-      console.error('[E2EE] resetEncryption: not logged in – token:', token, 'user:', currentUser)
-      throw new Error('You must be logged in to reset encryption keys.')
-    }
-
-    setUploading(true)
-    console.group('[E2EE] 🔄 resetEncryption – start')
-    try {
-      // Step 1: wipe all local keys
-      console.log('[E2EE] Step 1/4 – wiping local IndexedDB keys...')
-      await encryptionService.reset()
-      console.log('[E2EE] Step 1/4 done.')
-
-      // Step 2: re-bind the service to the user
-      console.log('[E2EE] Step 2/4 – re-setting account context...')
-      await encryptionService.setAccountContext(currentUser)
-      console.log('[E2EE] Step 2/4 done. context user:', currentUser.username)
-
-      // Step 3: generate fresh keys
-      console.log('[E2EE] Step 3/4 – generating new identity keys...')
-      await encryptionService.initialize()
-      console.log('[E2EE] Step 3/4 done.')
-
-      // Step 4: upload the new bundle to the server (unconditional)
-      console.log('[E2EE] Step 4/4 – fetching bundle & uploading to server...')
-      const bundle = await encryptionService.getEncryptionBundle()
-      console.log('[E2EE] Bundle ready | sigLen:', bundle.signedPreKey?.signature?.length ?? 0,
-        '| preKeys:', bundle.oneTimePreKeys?.length ?? 0)
-      await uploadEncryptionKeys(bundle, token)
-      console.log('[E2EE] Step 4/4 done. ✅ New keys live on server.')
-    } finally {
-      console.groupEnd()
-      setUploading(false)
-    }
-  }, [token, currentUser])
 
   const handleIncomingMessage = useCallback(
     async (message: ChatMessage) => {
@@ -377,194 +248,10 @@ export function useChatConnection() {
         typing.registerIncomingTyping(message)
         return
       }
-      
-      let processedMessage = { ...message }
-      const user = currentUserRef.current  // always-fresh, no stale closure
-
-      // Normalise isEncrypted: backend may use 'encrypted' or 'isEncrypted'
-      const isEnc = processedMessage.isEncrypted || (processedMessage as any).encrypted || false
-
-      if (isEnc && user) {
-        // Handle echoed own outgoing messages: we already rendered plaintext locally,
-        // but we MUST capture the server-assigned message ID to cache/vault it correctly
-        // so history looks correct after a page reload.
-        if (processedMessage.senderId === user.username) {
-          typing.clearSenderTyping(processedMessage.senderId)
-          
-          const incomingTime = processedMessage.timestamp ? new Date(processedMessage.timestamp).getTime() : 0
-          // Calculate fingerprint without content (since echo is encrypted, local was plain)
-          const fingerprint = [
-            processedMessage.type,
-            processedMessage.senderId,
-            processedMessage.roomId ?? '',
-            [...(processedMessage.recipients ?? [])].sort().join(','),
-          ].join('|')
-
-          // Guard against HMR state desync (ensure it's an array)
-          if (!Array.isArray(vaultSyncQueueRef.current)) vaultSyncQueueRef.current = []
-
-          // Find the best match in the pending queue (matching fingerprint + within 30s window)
-          const matchIndex = vaultSyncQueueRef.current.findIndex(p => 
-            p.fingerprint === fingerprint && Math.abs(p.timestamp - incomingTime) < 30000
-          )
-          
-          if (matchIndex !== -1) {
-            const pending = vaultSyncQueueRef.current[matchIndex]
-            console.debug('[Vault] Echo matched: caching final ID', processedMessage.id)
-            void cachePlaintext(processedMessage.id, pending.content)
-            encryptAndStoreToVault(processedMessage.id, pending.content)
-            // Remove from queue
-            vaultSyncQueueRef.current.splice(matchIndex, 1)
-          }
-          return
-        }
-
-        if (processedMessage.roomId && (processedMessage as any).isGroupEncryption) {
-          try {
-            const decryptedText = await groupEncryptionService.decryptGroupMessage(
-              processedMessage.roomId,
-              processedMessage.senderId,
-              processedMessage,
-              user.username
-            )
-            processedMessage.content = decryptedText
-            await cachePlaintext(processedMessage.id, decryptedText)   // ← cache
-            encryptAndStoreToVault(processedMessage.id, decryptedText) // ← vault (fire & forget)
-          } catch (error: any) {
-            console.warn('[E2EE] Group decryption failed:', error)
-            processedMessage.content = '[🔐 Encrypted group message – decryption failed]'
-          }
-        } else if (!processedMessage.roomId) {
-          // Build a fallback ciphertext descriptor when encryptionMetadata is absent
-          const meta = processedMessage.encryptionMetadata ?? {
-            type: 3,
-            body: processedMessage.content,
-          }
-          console.debug('[E2EE] Decrypting from', processedMessage.senderId,
-            'meta type:', meta?.type, 'has body:', Boolean(meta?.body))
-          try {
-            const decryptedText = await encryptionService.decryptMessage(
-              processedMessage.senderId,
-              meta
-            )
-            processedMessage.content = decryptedText
-            await cachePlaintext(processedMessage.id, decryptedText)   // ← cache so reload works
-            encryptAndStoreToVault(processedMessage.id, decryptedText) // ← vault (fire & forget)
-          } catch (error: any) {
-            const isInvalidKey = error?.message?.includes('Invalid private key') ||
-                                 error?.message?.includes('identity private key')
-            if (isInvalidKey) {
-              console.error('[E2EE] CRITICAL: Local keys invalid. Triggering silent repair.', error)
-              processedMessage.content = '[🔐 Security repair in progress — please refresh]'
-              if (!(window as any)._isRepairingSignal) {
-                ;(window as any)._isRepairingSignal = true
-                resetEncryption()
-                  .catch(err => console.error('[E2EE] Silent repair failed:', err))
-                  .finally(() => { setTimeout(() => { (window as any)._isRepairingSignal = false }, 5000) })
-              }
-            } else {
-              console.warn('[E2EE] Decryption failed from', processedMessage.senderId, '| error:', error?.message)
-              processedMessage.content = '[🔐 Encrypted message – decryption failed]'
-            }
-            // Clear broken session so next message triggers a fresh X3DH
-            try {
-              const address = new SignalProtocolAddress(processedMessage.senderId, 1)
-              await (encryptionService.getStore() as any).removeSession(address.toString())
-            } catch (e) {
-              console.error('[E2EE] Failed to clear broken session:', e)
-            }
-          }
-        }
-      }
-
-      typing.clearSenderTyping(processedMessage.senderId)
-      appendIncomingMessage(processedMessage)
+      typing.clearSenderTyping(message.senderId)
+      appendIncomingMessage(message)
     },
-    [appendIncomingMessage, typing, resetEncryption],  // currentUser removed — uses ref
-  )
-
-  const processMessagesWithDecryption = useCallback(
-    async (messages: ChatMessage[]) => {
-      // Use the ref so this is never stale when called synchronously during bootstrap
-      const user = currentUserRef.current
-      if (!user) return messages
-
-      const processed = await Promise.all(
-        messages.map(async (msg) => {
-          let processedMessage = { ...msg }
-
-          // Normalise isEncrypted field (backend may use either name)
-          const isEnc = processedMessage.isEncrypted || (processedMessage as any).encrypted || false
-          if (!isEnc) return processedMessage
-
-          // ── Cache first: never re-process an already-consumed Signal message ──
-          const cached = await getCachedPlaintext(processedMessage.id)
-          if (cached !== null) {
-            processedMessage.content = cached
-            return processedMessage
-          }
-
-          if (processedMessage.roomId && (processedMessage as any).isGroupEncryption) {
-            try {
-              const decryptedText = await groupEncryptionService.decryptGroupMessage(
-                processedMessage.roomId,
-                processedMessage.senderId,
-                processedMessage,
-                user.username
-              )
-              processedMessage.content = decryptedText
-              await cachePlaintext(processedMessage.id, decryptedText)
-              encryptAndStoreToVault(processedMessage.id, decryptedText) // ← vault (fire & forget)
-            } catch {
-              processedMessage.content = '[\uD83D\uDD10 Encrypted group message \u2013 decryption failed]'
-            }
-          } else if (!processedMessage.roomId) {
-            if (processedMessage.senderId === user.username) {
-              // Own sent DMs: Signal cannot decrypt its own ciphertext.
-              // Try to restore from the Message Vault before giving up.
-              const vk = vaultKeyRef.current
-              if (processedMessage.id && token && vk) {
-                try {
-                  const vaultItem = await vaultApi.fetchOne(processedMessage.id, token)
-                  if (vaultItem && vaultItem.ciphertext) {
-                    const decrypted = await decryptFromVault(vaultItem.ciphertext, vk)
-                    if (decrypted) {
-                      processedMessage.content = decrypted
-                      await cachePlaintext(processedMessage.id, decrypted)
-                      return processedMessage
-                    }
-                  }
-                } catch (e) {
-                  console.warn('[Vault] On-demand restore failed for', processedMessage.id, e)
-                }
-              }
-              // If vault restore also fails, THEN show a (more descriptive) placeholder
-              processedMessage.content = '[\uD83D\uDD10 Message vaulted \u2013 restoring...]'
-            } else {
-              // Build fallback descriptor when encryptionMetadata is absent
-              const meta = processedMessage.encryptionMetadata ?? {
-                type: 3,
-                body: processedMessage.content,
-              }
-              try {
-                const decryptedText = await encryptionService.decryptMessage(
-                  processedMessage.senderId,
-                  meta
-                )
-                processedMessage.content = decryptedText
-                await cachePlaintext(processedMessage.id, decryptedText)
-                encryptAndStoreToVault(processedMessage.id, decryptedText) // ← vault (fire & forget)
-              } catch {
-                processedMessage.content = '[\uD83D\uDD10 Encrypted message \u2013 decryption failed]'
-              }
-            }
-          }
-          return processedMessage
-        })
-      )
-      return processed
-    },
-    [] // no currentUser dependency — reads from currentUserRef which is always fresh
+    [appendIncomingMessage, typing],
   )
 
   const connectSocket = useCallback(
@@ -601,8 +288,7 @@ export function useChatConnection() {
       setLoadingHistory(true)
       try {
         const slice = await fetchRoomHistory(roomId, authToken, 0)
-        let initialMessages = [...slice.content].reverse()
-        initialMessages = await processMessagesWithDecryption(initialMessages)
+        const initialMessages = [...slice.content].reverse()
 
         setGroupMessages((current) => ({
           ...current,
@@ -614,14 +300,13 @@ export function useChatConnection() {
           },
         }))
       } catch (error) {
-        const readable =
-          error instanceof Error ? error.message : 'Unable to load room history.'
+        const readable = error instanceof Error ? error.message : 'Unable to load room history.'
         pushError('rest', readable)
       } finally {
         setLoadingHistory(false)
       }
     },
-    [pushError, processMessagesWithDecryption],
+    [pushError],
   )
 
   const ensureDirectHistory = useCallback(
@@ -629,8 +314,7 @@ export function useChatConnection() {
       setLoadingHistory(true)
       try {
         const slice = await fetchDirectHistory(contactId, authToken, 0)
-        let initialMessages = [...slice.content].reverse()
-        initialMessages = await processMessagesWithDecryption(initialMessages)
+        const initialMessages = [...slice.content].reverse()
 
         setDirectMessages((current) => ({
           ...current,
@@ -642,18 +326,18 @@ export function useChatConnection() {
           },
         }))
       } catch (error) {
-        const readable =
-          error instanceof Error ? error.message : 'Unable to load direct chat history.'
+        const readable = error instanceof Error ? error.message : 'Unable to load direct chat history.'
         pushError('rest', readable)
       } finally {
         setLoadingHistory(false)
       }
     },
-    [pushError, processMessagesWithDecryption],
+    [pushError],
   )
 
   const loadMoreHistory = useCallback(async () => {
-    if (!activeConversation || !token || loadingHistory) return
+    const t = tokenRef.current
+    if (!activeConversation || !t || loadingHistory) return
 
     const isGroup = activeConversation.type === 'group'
     const id = isGroup ? activeConversation.group.roomId : activeConversation.contact.id
@@ -664,12 +348,11 @@ export function useChatConnection() {
     setLoadingHistory(true)
     try {
       const nextPage = currentState.currentPage + 1
-      const slice = isGroup 
-        ? await fetchRoomHistory(id, token, nextPage)
-        : await fetchDirectHistory(id, token, nextPage)
-      
-      let newMessages = [...slice.content].reverse()
-      newMessages = await processMessagesWithDecryption(newMessages)
+      const slice = isGroup
+        ? await fetchRoomHistory(id, t, nextPage)
+        : await fetchDirectHistory(id, t, nextPage)
+
+      const newMessages = [...slice.content].reverse()
 
       const setter = isGroup ? setGroupMessages : setDirectMessages
       setter((current) => {
@@ -689,7 +372,7 @@ export function useChatConnection() {
     } finally {
       setLoadingHistory(false)
     }
-  }, [activeConversation, token, loadingHistory, groupMessages, directMessages, pushError, processMessagesWithDecryption])
+  }, [activeConversation, loadingHistory, groupMessages, directMessages, pushError])
 
   const bootstrapAuthenticatedChat = useCallback(
     async (authenticatedSession: AuthSession) => {
@@ -697,52 +380,6 @@ export function useChatConnection() {
       try {
         const authenticatedUser = await fetchAuthenticatedUser(authenticatedSession.token)
         setCurrentUser(authenticatedUser)
-        // Scope the plaintext cache to this user immediately
-        setCacheUser(authenticatedUser.id)
-
-        // ── Vault pre-warm — populate IndexedDB cache from server vault ───────────────
-        try {
-          if (!vaultKeyRef.current) {
-            const restoredKey = await restoreVaultKeyFromSession()
-            if (restoredKey) {
-              vaultKeyRef.current = restoredKey
-              console.log('[Vault] Pre-warming IndexedDB cache from server vault...')
-              void syncEntireVaultToCache(authenticatedSession.token, restoredKey)
-            }
-          }
-        } catch (e) {
-          console.warn('[Vault] Pre-warm failed:', e)
-        }
-
-        try {
-          if (!encryptionService.isContextSet(authenticatedUser.id)) {
-            console.log('[E2EE] Session restore path – setting account context without password.')
-            await encryptionService.setAccountContext(authenticatedUser)
-            // Restore vault key from session if possible (redundant but safe)
-            const restoredKey = await restoreVaultKeyFromSession()
-            if (restoredKey) {
-              vaultKeyRef.current = restoredKey
-              void syncEntireVaultToCache(authenticatedSession.token, restoredKey)
-            }
-          }
-          await encryptionService.initialize()
-
-          const localBundle = await encryptionService.getEncryptionBundle()
-          let serverIdentityKey: string | null = null
-          try {
-            const existing = await fetchUserEncryptionBundle(authenticatedUser.username, authenticatedSession.token)
-            serverIdentityKey = existing?.identityPublicKey ?? null
-          } catch {
-            serverIdentityKey = null
-          }
-
-          const keysMatch = serverIdentityKey !== null && serverIdentityKey === localBundle.identityPublicKey
-          if (!keysMatch) {
-            await uploadEncryptionKeys(localBundle, authenticatedSession.token)
-          }
-        } catch (e) {
-          console.error('[E2EE] Bootstrap failed (non-fatal):', e)
-        }
 
         const [bootstrapData, liveContacts, liveGroups] = await Promise.all([
           fetchBootstrap(authenticatedSession.token),
@@ -752,12 +389,11 @@ export function useChatConnection() {
 
         setContacts(normalizeContacts(liveContacts))
         setGroups(liveGroups)
-        
+
         const initialDirectState: Record<string, ConversationState> = {}
         for (const [contactId, messages] of Object.entries(bootstrapData.directMessages || {})) {
-          const processed = await processMessagesWithDecryption(messages)
           initialDirectState[contactId] = {
-            messages: dedupeAndSort(processed.filter((m) => m.type !== 'TYPING')),
+            messages: dedupeAndSort(messages.filter((m) => m.type !== 'TYPING')),
             hasNext: true,
             currentPage: 0,
             hasLoadedInitial: true,
@@ -767,9 +403,8 @@ export function useChatConnection() {
 
         const initialGroupState: Record<string, ConversationState> = {}
         for (const [roomId, messages] of Object.entries(bootstrapData.groupMessages || {})) {
-          const processed = await processMessagesWithDecryption(messages)
           initialGroupState[roomId] = {
-            messages: dedupeAndSort(processed.filter((m) => m.type !== 'TYPING')),
+            messages: dedupeAndSort(messages.filter((m) => m.type !== 'TYPING')),
             hasNext: true,
             currentPage: 0,
             hasLoadedInitial: true,
@@ -786,7 +421,7 @@ export function useChatConnection() {
         setIsBootstrapping(false)
       }
     },
-    [connectSocket, setSession, processMessagesWithDecryption, restoreVaultKeyFromSession]
+    [connectSocket, setSession]
   )
 
   const login = useCallback(
@@ -796,16 +431,6 @@ export function useChatConnection() {
         const nextSession = await loginUser(username, password)
         setSession(nextSession)
         bootstrappedTokenRef.current = nextSession.token
-        
-        await encryptionService.setAccountContext(nextSession.user, password)
-        try {
-          const vk = await deriveVaultKey(password, String(nextSession.user.id))
-          vaultKeyRef.current = vk
-          await saveVaultKeyToSession(vk)
-          void syncEntireVaultToCache(nextSession.token, vk)
-        } catch (vaultErr) {
-          console.warn('[Vault] Key derivation failed:', vaultErr)
-        }
         await bootstrapAuthenticatedChat(nextSession)
       } catch (error: any) {
         console.error('Login process failed:', error)
@@ -813,15 +438,12 @@ export function useChatConnection() {
         throw error
       }
     },
-    [bootstrapAuthenticatedChat, clearErrors, pushError, saveVaultKeyToSession, setSession]
+    [bootstrapAuthenticatedChat, clearErrors, pushError, setSession]
   )
 
   const logout = useCallback(() => {
     socketRef.current?.disconnect()
     socketRef.current = null
-    encryptionService.logout()
-    vaultKeyRef.current = null
-    try { sessionStorage.removeItem('fc-vk') } catch { }
     setSession(null)
     setCurrentUser(null)
     setContacts([])
@@ -850,12 +472,6 @@ export function useChatConnection() {
         if (!existingState || !existingState.hasLoadedInitial) {
           await ensureDirectHistory(conversation.contact.id, t)
         }
-        try {
-          const bundle = await fetchUserEncryptionBundle(conversation.contact.id, t)
-          await encryptionService.preEstablishSession(conversation.contact.id, bundle)
-        } catch (e) {
-          console.warn('[E2EE] Pre-fetch failed:', e)
-        }
       }
     },
     [directMessages, ensureDirectHistory, ensureGroupHistory, session?.token, groupMessages],
@@ -868,7 +484,7 @@ export function useChatConnection() {
       const trimmedText = text.trim()
       if (!trimmedText) return
 
-      let finalMessage: ChatMessage = {
+      const finalMessage: ChatMessage = {
         senderId: currentUser.username,
         senderName: currentUser.displayName,
         roomId: activeConversation.type === 'group' ? activeConversation.group.roomId : undefined,
@@ -878,60 +494,18 @@ export function useChatConnection() {
         timestamp: new Date().toISOString(),
       }
 
-      if (activeConversation.type === 'direct') {
-        try {
-          const bundle = await fetchUserEncryptionBundle(activeConversation.contact.id, session.token)
-          const encryptedData = await encryptionService.encryptMessage(
-            activeConversation.contact.id, trimmedText, bundle
-          )
-          finalMessage.isEncrypted = true
-          finalMessage.content = encryptedData.body
-          finalMessage.encryptionMetadata = encryptedData
-        } catch (e) {
-          console.error('[E2EE] Encryption failed:', e)
-        }
-      } else if (activeConversation.type === 'group') {
-        try {
-          const members = activeConversation.group.members ?? []
-          const encryptedGroupData = await groupEncryptionService.encryptGroupMessage(
-            activeConversation.group.roomId, members, trimmedText
-          )
-          finalMessage = { ...finalMessage, ...encryptedGroupData }
-        } catch (e) {
-          console.error('[E2EE] Group encryption failed:', e)
-        }
-      }
-
-      const fingerprint = getMessageFingerprint(finalMessage)
-      if (!Array.isArray(vaultSyncQueueRef.current)) vaultSyncQueueRef.current = []
-      vaultSyncQueueRef.current.push({
-        timestamp: new Date(finalMessage.timestamp!).getTime(),
-        fingerprint,
-        content: trimmedText
-      })
-
       sendSocketMessage(finalMessage)
-      appendIncomingMessage({ ...finalMessage, content: trimmedText, isEncrypted: false })
+      appendIncomingMessage(finalMessage)
     },
     [activeConversation, appendIncomingMessage, currentUser, sendSocketMessage, session?.token],
   )
 
   const sendMediaMessage = useCallback(
-    async (file: File) => {
+    async (file: File, caption?: string) => {
       if (!currentUser || !session?.token || !activeConversation) return
       setUploading(true)
       try {
-        let fileToUpload: File | Blob = file
-        if (activeConversation.type === 'direct') {
-          try {
-            const encryptedData = await encryptionService.encryptFile(file)
-            fileToUpload = encryptedData.encryptedBlob
-          } catch (e) {
-            console.error('File encryption failed:', e)
-          }
-        }
-
-        const uploaded = await uploadMedia(fileToUpload as File, session.token)
+        const uploaded = await uploadMedia(file, session.token)
         setMediaLibrary((current) => ({ ...current, [uploaded.id]: uploaded }))
 
         const finalMessage: ChatMessage = {
@@ -939,13 +513,14 @@ export function useChatConnection() {
           senderName: currentUser.displayName,
           roomId: activeConversation.type === 'group' ? activeConversation.group.roomId : undefined,
           recipients: activeConversation.type === 'direct' ? [activeConversation.contact.id] : undefined,
+          content: caption ? caption.trim() : undefined,
           mediaId: uploaded.id,
           type: 'MEDIA',
           timestamp: new Date().toISOString(),
         }
 
         sendSocketMessage(finalMessage)
-        appendIncomingMessage({ ...finalMessage, isEncrypted: false })
+        appendIncomingMessage(finalMessage)
       } catch (error) {
         pushError('rest', 'Unable to upload file.')
       } finally {
@@ -1017,6 +592,21 @@ export function useChatConnection() {
     }
   }, [session?.token, setSession])
 
+  const clearAppStorage = useCallback(async () => {
+    localStorage.clear()
+    sessionStorage.clear()
+    const dbs = ['fc-msg-plain', 'signal-store', 'key-val-store']
+    await Promise.all(dbs.map(dbName => {
+      return new Promise<void>((resolve) => {
+        const req = indexedDB.deleteDatabase(dbName)
+        req.onsuccess = () => resolve()
+        req.onerror = () => resolve()
+        req.onblocked = () => resolve()
+      })
+    }))
+    window.location.reload()
+  }, [])
+
   useEffect(() => { restoreSessionRef.current = session }, [session])
 
   useEffect(() => {
@@ -1038,6 +628,38 @@ export function useChatConnection() {
     if (activeConversation.type === 'group') return groupMessages[activeConversation.group.roomId]?.messages ?? []
     return directMessages[activeConversation.contact.id]?.messages ?? []
   }, [activeConversation, directMessages, groupMessages])
+
+  useEffect(() => {
+    if (!currentUser || !activeConversation || status !== 'connected' || !socketRef.current?.isConnected()) return
+
+    let needsUpdate = false
+    const updatedMessages = activeMessages.map(m => {
+      if (m.id && m.senderId !== currentUser.username && m.status !== 'READ') {
+        socketRef.current?.publishStatus(m.id, 'READ')
+        needsUpdate = true
+        return { ...m, status: 'READ' as const }
+      }
+      return m
+    })
+
+    if (needsUpdate) {
+      const isGroup = activeConversation.type === 'group'
+      const id = isGroup ? activeConversation.group.roomId : activeConversation.contact.id
+      const setter = isGroup ? setGroupMessages : setDirectMessages
+
+      setter((current) => {
+        const prev = current[id]
+        if (!prev) return current
+        return {
+          ...current,
+          [id]: {
+            ...prev,
+            messages: updatedMessages
+          }
+        }
+      })
+    }
+  }, [activeMessages, activeConversation, currentUser, status])
 
   const hasNextPage = useMemo(() => {
     if (!activeConversation) return false
@@ -1083,6 +705,6 @@ export function useChatConnection() {
     loadMoreHistory,
     hasNextPage,
     isLoadingMore: loadingHistory,
-    resetEncryption,
+    clearAppStorage,
   }
 }

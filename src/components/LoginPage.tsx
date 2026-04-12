@@ -271,16 +271,16 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
   const error = chat.errors[0]?.message
 
   return (
-    <div style={{ position: 'relative', width: '100vw', height: '100dvh', overflow: 'hidden', fontFamily: "'Inter', 'Segoe UI', sans-serif" }}>
+    <div style={{ position: 'relative', width: '100vw', height: '100dvh', overflowY: 'auto', overflowX: 'hidden', fontFamily: "'Inter', 'Segoe UI', sans-serif" }}>
       {/* Animated canvas background */}
       <canvas
         ref={canvasRef}
-        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
+        style={{ position: 'fixed', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}
       />
 
       {/* Subtle grid overlay */}
       <div style={{
-        position: 'absolute', inset: 0,
+        position: 'fixed', inset: 0,
         backgroundImage: `
           linear-gradient(rgba(0,168,132,0.04) 1px, transparent 1px),
           linear-gradient(90deg, rgba(0,168,132,0.04) 1px, transparent 1px)
@@ -294,14 +294,13 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
         position: 'relative',
         zIndex: 10,
         display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
         width: '100%',
-        height: '100%',
+        minHeight: '100%',
         padding: '16px',
         boxSizing: 'border-box',
       }}>
         <div style={{
+          margin: 'auto',
           width: '100%',
           maxWidth: '420px',
           background: 'rgba(11,20,26,0.72)',

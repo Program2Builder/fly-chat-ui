@@ -72,8 +72,7 @@ export interface ChatMessage {
   type: MessageType
   mediaId?: string
   timestamp?: string
-  isEncrypted?: boolean
-  encryptionMetadata?: any
+  status?: 'SENT' | 'DELIVERED' | 'READ'
 }
 
 export interface MediaUploadResponse {
@@ -91,16 +90,16 @@ export type ConnectionStatus =
   | 'error'
 
 export interface ChatError {
-  source: 'auth' | 'rest' | 'websocket' | 'validation'
+  source: 'auth' | 'rest' | 'websocket' | 'validation' | 'info'
   message: string
 }
 
 export type ActiveConversation =
   | {
-      type: 'group'
-      group: ChatGroup
-    }
+    type: 'group'
+    group: ChatGroup
+  }
   | {
-      type: 'direct'
-      contact: ChatContact
-    }
+    type: 'direct'
+    contact: ChatContact
+  }
