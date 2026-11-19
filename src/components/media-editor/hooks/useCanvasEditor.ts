@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { fabric } from 'fabric'
-import { dataUrlToBlob, clampDimensions } from '../utils/imageExport'
+import * as fabric from 'fabric'
+import { dataUrlToBlob } from '../utils/imageExport'
 
 export type FabricTool = 'draw' | 'text' | 'sticker' | 'crop' | 'none'
 
@@ -9,7 +9,8 @@ const DEFAULT_DRAW_COLOR = '#ff0000'
 
 export function useCanvasEditor(
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
-  imageUrl: string | null
+  imageUrl: string | null,
+  containerRef?: React.RefObject<HTMLElement | null>
 ) {
   const fabricRef = useRef<fabric.Canvas | null>(null)
   const [activeTool, setActiveTool] = useState<FabricTool>('none')
@@ -24,7 +25,13 @@ export function useCanvasEditor(
   // Crop state
   const cropRectRef = useRef<fabric.Rect | null>(null)
   const cropMasksRef = useRef<fabric.Rect[]>([])
+  const cropTransformHandlerRef = useRef<((e: fabric.CanvasEvents['object:moving']) => void) | null>(null)
   const cropRegionRef = useRef<{ left: number; top: number; width: number; height: number } | null>(null)
+
+  // Natural (unscaled) source image size, used to export at full resolution.
+  const sourceSizeRef = useRef<{ width: number; height: number } | null>(null)
+  // Last canvas size applied by the fit logic.
+  const fitKeyRef = useRef<string | null>(null)
 
   const saveSnapshot = useCallback(() => {
     const canvas = fabricRef.current
@@ -32,6 +39,59 @@ export function useCanvasEditor(
     undoStack.current.push(JSON.stringify(canvas.toJSON()))
     redoStack.current = []
   }, [])
+
+  // Scale the canvas (and its image) so the whole image fits the visible area.
+  const fitImageToContainer = useCallback(
+    (canvas: fabric.Canvas, img: fabric.FabricImage, force = false) => {
+      const naturalWidth = img.width || 1
+      const naturalHeight = img.height || 1
+
+      let maxWidth = Math.min(window.innerWidth * 0.92, 1280)
+      let maxHeight = window.innerHeight * 0.9
+
+      const container = containerRef?.current
+      if (container) {
+        const style = window.getComputedStyle(container)
+        const availableWidth =
+          container.clientWidth -
+          (parseFloat(style.paddingLeft) || 0) -
+          (parseFloat(style.paddingRight) || 0)
+        const availableHeight =
+          container.clientHeight -
+          (parseFloat(style.paddingTop) || 0) -
+          (parseFloat(style.paddingBottom) || 0)
+        if (availableWidth > 0) maxWidth = availableWidth
+        if (availableHeight > 0) maxHeight = availableHeight
+      }
+
+      const ratio = Math.min(maxWidth / naturalWidth, maxHeight / naturalHeight, 1)
+      const width = Math.max(1, Math.round(naturalWidth * ratio))
+      const height = Math.max(1, Math.round(naturalHeight * ratio))
+
+      // Avoid pointless re-renders (and ResizeObserver feedback loops) when
+      // the available area did not actually change.
+      const fitKey = `${width}x${height}`
+      if (!force && fitKeyRef.current === fitKey) return
+      fitKeyRef.current = fitKey
+
+      canvas.setDimensions({ width, height })
+      // Fabric v6+ defaults to a centered origin; anchor the photo to the
+      // top-left of the canvas so the whole image is visible instead of only
+      // its bottom-right quadrant.
+      img.set({
+        originX: 'left',
+        originY: 'top',
+        scaleX: width / naturalWidth,
+        scaleY: height / naturalHeight,
+        left: 0,
+        top: 0,
+        objectCaching: false,
+      })
+      img.setCoords()
+      canvas.renderAll()
+    },
+    [containerRef]
+  )
 
   useEffect(() => {
     if (!canvasRef.current) return
@@ -43,36 +103,39 @@ export function useCanvasEditor(
       selection: true,
     })
     fabricRef.current = canvas
+    undoStack.current = []
+    redoStack.current = []
+    cropRectRef.current = null
+    cropMasksRef.current = []
+    cropTransformHandlerRef.current = null
+    cropRegionRef.current = null
+    sourceSizeRef.current = null
+    fitKeyRef.current = null
 
     canvas.on('object:modified', saveSnapshot)
     canvas.on('path:created', saveSnapshot)
 
     if (imageUrl) {
-      fabric.Image.fromURL(
-        imageUrl,
-        (img) => {
-          if (disposed || !fabricRef.current) return
+      fabric.Image.fromURL(imageUrl, { crossOrigin: 'anonymous' })
+        .then((img) => {
+          if (disposed || fabricRef.current !== canvas) return
 
-          const { width: cw, height: ch } = clampDimensions(
-            img.width || 800,
-            img.height || 600,
-            Math.min(window.innerWidth * 0.92, 1280)
-          )
-          const scaleX = cw / (img.width || 1)
-          const scaleY = ch / (img.height || 1)
-
-          canvas.setWidth(cw)
-          canvas.setHeight(ch)
-
-          img.set({ scaleX, scaleY, left: 0, top: 0, selectable: false, evented: false })
+          img.set({ selectable: false, evented: false })
           canvas.add(img)
-          canvas.sendToBack(img)
-          canvas.renderAll()
+          canvas.sendObjectToBack(img)
+          sourceSizeRef.current = {
+            width: img.width || canvas.width || 1,
+            height: img.height || canvas.height || 1,
+          }
+          fitImageToContainer(canvas, img)
 
           undoStack.current = [JSON.stringify(canvas.toJSON())]
-        },
-        { crossOrigin: 'anonymous' }
-      )
+        })
+        .catch((error) => {
+          if (!disposed) {
+            console.error('Failed to load image for canvas editor', error)
+          }
+        })
     }
 
     return () => {
@@ -80,14 +143,35 @@ export function useCanvasEditor(
       canvas.dispose()
       fabricRef.current = null
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [imageUrl])
+  }, [canvasRef, fitImageToContainer, imageUrl, saveSnapshot])
+
+  // Refit the image when the editor area is resized.
+  useEffect(() => {
+    const container = containerRef?.current
+    if (!container) return
+
+    const observer = new ResizeObserver(() => {
+      const canvas = fabricRef.current
+      if (!canvas) return
+      const image = canvas
+        .getObjects()
+        .find((obj): obj is fabric.FabricImage => obj instanceof fabric.FabricImage)
+      if (image) fitImageToContainer(canvas, image)
+    })
+    observer.observe(container)
+    return () => observer.disconnect()
+  }, [containerRef, fitImageToContainer])
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
 
   const removeCropOverlay = useCallback(() => {
     const canvas = fabricRef.current
     if (!canvas) return
+    if (cropTransformHandlerRef.current) {
+      canvas.off('object:moving', cropTransformHandlerRef.current)
+      canvas.off('object:scaling', cropTransformHandlerRef.current)
+      cropTransformHandlerRef.current = null
+    }
     if (cropRectRef.current) {
       canvas.remove(cropRectRef.current)
       cropRectRef.current = null
@@ -106,12 +190,14 @@ export function useCanvasEditor(
     const w = (cropRect.width ?? 100) * (cropRect.scaleX ?? 1)
     const h = (cropRect.height ?? 100) * (cropRect.scaleY ?? 1)
 
-    const maskProps = {
+    const maskProps: Partial<fabric.RectProps> = {
       fill: 'rgba(0,0,0,0.5)',
       selectable: false,
       evented: false,
       excludeFromExport: true,
-    } as fabric.IRectOptions
+      originX: 'left',
+      originY: 'top',
+    }
 
     const masks = [
       // Top
@@ -129,7 +215,7 @@ export function useCanvasEditor(
     masks.forEach((m) => canvas.add(m))
 
     // Keep crop rect on top
-    canvas.bringToFront(cropRect)
+    canvas.bringObjectToFront(cropRect)
     canvas.renderAll()
   }, [])
 
@@ -164,7 +250,7 @@ export function useCanvasEditor(
 
   const activateCrop = useCallback(() => {
     const canvas = fabricRef.current
-    if (!canvas) return
+    if (!canvas || cropRectRef.current) return
 
     setActiveTool('crop')
     canvas.isDrawingMode = false
@@ -183,10 +269,11 @@ export function useCanvasEditor(
       strokeWidth: 2,
       strokeDashArray: [6, 4],
       selectable: true,
-      hasRotatingPoint: false,
       lockRotation: true,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any)
+      excludeFromExport: true,
+      originX: 'left',
+      originY: 'top',
+    })
 
     cropRectRef.current = cropRect
     canvas.add(cropRect)
@@ -194,12 +281,12 @@ export function useCanvasEditor(
     updateMasks(cropRect)
 
     // Redraw masks as the user resizes/moves the crop rect
-    canvas.on('object:moving', (e) => {
+    const handleCropTransform = (e: fabric.CanvasEvents['object:moving']) => {
       if (e.target === cropRect) updateMasks(cropRect)
-    })
-    canvas.on('object:scaling', (e) => {
-      if (e.target === cropRect) updateMasks(cropRect)
-    })
+    }
+    cropTransformHandlerRef.current = handleCropTransform
+    canvas.on('object:moving', handleCropTransform)
+    canvas.on('object:scaling', handleCropTransform)
   }, [updateMasks])
 
   const confirmCrop = useCallback(() => {
@@ -243,7 +330,7 @@ export function useCanvasEditor(
   const addText = useCallback(() => {
     const canvas = fabricRef.current
     if (!canvas) return
-    saveSnapshot()
+    canvas.isDrawingMode = false
     const text = new fabric.IText('Type here', {
       left: (canvas.width ?? 400) / 2,
       top: (canvas.height ?? 300) / 2,
@@ -257,13 +344,14 @@ export function useCanvasEditor(
     canvas.add(text)
     canvas.setActiveObject(text)
     canvas.renderAll()
+    saveSnapshot()
     setActiveTool('text')
   }, [saveSnapshot])
 
   const addSticker = useCallback(() => {
     const canvas = fabricRef.current
     if (!canvas) return
-    saveSnapshot()
+    canvas.isDrawingMode = false
     const emojis = ['😎', '❤️', '🔥', '✨', '😂', '👍', '🎉']
     const emoji = emojis[Math.floor(Math.random() * emojis.length)]
     const sticker = new fabric.Text(emoji, {
@@ -276,19 +364,40 @@ export function useCanvasEditor(
     canvas.add(sticker)
     canvas.setActiveObject(sticker)
     canvas.renderAll()
+    saveSnapshot()
     setActiveTool('sticker')
   }, [saveSnapshot])
 
   const rotateActiveOrImage = useCallback(() => {
     const canvas = fabricRef.current
     if (!canvas) return
-    saveSnapshot()
     const obj = canvas.getActiveObject()
     if (obj) {
       obj.rotate(((obj.angle ?? 0) + 90) % 360)
+      obj.setCoords()
       canvas.renderAll()
+      saveSnapshot()
     }
   }, [saveSnapshot])
+
+  const applySnapshot = useCallback(async (json: string) => {
+    const canvas = fabricRef.current
+    if (!canvas) return
+    isMutating.current = true
+    try {
+      await canvas.loadFromJSON(json)
+      // The source image is serialized as a regular object, so restore its
+      // non-interactive flags after every history restore.
+      canvas.getObjects().forEach((obj) => {
+        if (obj instanceof fabric.FabricImage) {
+          obj.set({ selectable: false, evented: false })
+        }
+      })
+      canvas.requestRenderAll()
+    } finally {
+      isMutating.current = false
+    }
+  }, [])
 
   const undo = useCallback(() => {
     const canvas = fabricRef.current
@@ -296,34 +405,26 @@ export function useCanvasEditor(
     const current = undoStack.current.pop()!
     redoStack.current.push(current)
     const prev = undoStack.current[undoStack.current.length - 1]
-    isMutating.current = true
-    canvas.loadFromJSON(prev, () => {
-      canvas.renderAll()
-      isMutating.current = false
-    })
-  }, [])
+    void applySnapshot(prev)
+  }, [applySnapshot])
 
   const redo = useCallback(() => {
     const canvas = fabricRef.current
     if (!canvas || redoStack.current.length === 0) return
     const next = redoStack.current.pop()!
     undoStack.current.push(next)
-    isMutating.current = true
-    canvas.loadFromJSON(next, () => {
-      canvas.renderAll()
-      isMutating.current = false
-    })
-  }, [])
+    void applySnapshot(next)
+  }, [applySnapshot])
 
   const deleteSelected = useCallback(() => {
     const canvas = fabricRef.current
     if (!canvas) return
     const obj = canvas.getActiveObject()
     if (obj && obj.selectable) {
-      saveSnapshot()
       canvas.remove(obj)
       canvas.discardActiveObject()
       canvas.renderAll()
+      saveSnapshot()
     }
   }, [saveSnapshot])
 
@@ -334,17 +435,26 @@ export function useCanvasEditor(
     canvas.discardActiveObject()
     canvas.renderAll()
 
+    // Render the export at (up to) the source image resolution so annotations
+    // stay sharp instead of being limited to the on-screen canvas size.
+    const source = sourceSizeRef.current
+    const displayWidth = canvas.width || 1
+    const multiplier = source
+      ? Math.min(4, Math.max(1, source.width / displayWidth))
+      : 1
+
     const region = cropRegionRef.current
     const dataUrl = region
       ? canvas.toDataURL({
           format: 'jpeg',
           quality: 0.88,
+          multiplier,
           left: region.left,
           top: region.top,
           width: region.width,
           height: region.height,
         })
-      : canvas.toDataURL({ format: 'jpeg', quality: 0.82 })
+      : canvas.toDataURL({ format: 'jpeg', quality: 0.85, multiplier })
 
     return dataUrlToBlob(dataUrl)
   }, [])

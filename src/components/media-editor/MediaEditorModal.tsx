@@ -1,20 +1,25 @@
-import React, { useRef } from 'react'
-import { Dialog, Box, TextField, IconButton } from '@mui/material'
+import { useRef } from 'react'
+import { Dialog, Box, TextField, IconButton, Typography } from '@mui/material'
 import EmojiEmotionsRoundedIcon from '@mui/icons-material/EmojiEmotionsRounded'
 import InsertDriveFileRoundedIcon from '@mui/icons-material/InsertDriveFileRounded'
 import AddRoundedIcon from '@mui/icons-material/AddRounded'
 import SendRoundedIcon from '@mui/icons-material/SendRounded'
-import CloseRoundedIcon from '@mui/icons-material/CloseRounded'
 import { CanvasEditor } from './CanvasEditor'
 import type { CanvasEditorRef } from './CanvasEditor'
 import { VideoEditor } from './VideoEditor'
 import type { VideoEditorRef } from './VideoEditor'
+import { DocumentPreview } from './DocumentPreview'
+import { getDocumentInfo } from './utils/fileInfo'
 
 export interface MediaEditorModalProps {
   previewFile: File | null
   previewUrl: string | null
   previewCaption: string
   setPreviewCaption: (c: string) => void
+  /** Picked through the "Document" entry: preview as a file, never edit it. */
+  asDocument?: boolean
+  /** Opens the file picker again so the attachment can be swapped. */
+  onReplace?: () => void
   onClose: () => void
   onSend: (file: File | null, metadata?: { startTime: number, endTime: number }) => Promise<void>
   uploading: boolean
@@ -25,6 +30,8 @@ export function MediaEditorModal({
   previewUrl,
   previewCaption,
   setPreviewCaption,
+  asDocument = false,
+  onReplace,
   onClose,
   onSend,
   uploading
@@ -32,10 +39,17 @@ export function MediaEditorModal({
   const canvasEditorRef = useRef<CanvasEditorRef>(null)
   const videoEditorRef = useRef<VideoEditorRef>(null)
 
+  const isImage = !asDocument && (previewFile?.type.startsWith('image/') ?? false)
+  const isVideo = !asDocument && (previewFile?.type.startsWith('video/') ?? false)
+  const isDocument = Boolean(previewFile) && !isImage && !isVideo
+  const documentInfo = previewFile && isDocument
+    ? getDocumentInfo(previewFile.name, previewFile.type)
+    : null
+
   const handleSend = async () => {
     if (!previewFile) return
-    
-    if (previewFile.type.startsWith('image/')) {
+
+    if (isImage) {
         if (canvasEditorRef.current) {
             try {
               const editedBlob = await canvasEditorRef.current.exportBlob()
@@ -48,13 +62,15 @@ export function MediaEditorModal({
         } else {
             await onSend(previewFile)
         }
-    } else if (previewFile.type.startsWith('video/')) {
+    } else if (isVideo) {
         let metadata
         if (videoEditorRef.current) {
             metadata = videoEditorRef.current.exportMetadata()
         }
         await onSend(previewFile, metadata)
     } else {
+        // Documents are sent exactly as selected, with their original name
+        // and MIME type.
         await onSend(previewFile)
     }
   }
@@ -68,25 +84,16 @@ export function MediaEditorModal({
         sx: { bgcolor: '#0b141a', display: 'flex', flexDirection: 'column' }
       }}
     >
-      {previewFile?.type.startsWith('image/') && previewUrl && (
+      {isImage && previewUrl && (
         <CanvasEditor ref={canvasEditorRef} imageUrl={previewUrl} onClose={onClose} />
       )}
       
-      {previewFile?.type.startsWith('video/') && previewUrl && (
+      {isVideo && previewUrl && (
         <VideoEditor ref={videoEditorRef} videoUrl={previewUrl} onClose={onClose} />
       )}
 
-      {(!previewFile?.type.startsWith('image/') && !previewFile?.type.startsWith('video/')) && (
-        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-           <Box sx={{ p: 2 }}>
-             <IconButton onClick={onClose} sx={{ color: '#e9edef' }}>
-                <CloseRoundedIcon />
-             </IconButton>
-           </Box>
-           <Box sx={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-             <InsertDriveFileRoundedIcon sx={{ fontSize: 100, color: '#8696a0' }} />
-           </Box>
-        </Box>
+      {isDocument && previewFile && (
+        <DocumentPreview file={previewFile} previewUrl={previewUrl} onClose={onClose} />
       )}
 
       {/* Shared Bottom Compose Row */}
@@ -127,10 +134,24 @@ export function MediaEditorModal({
                display: 'flex', justifyContent: 'center', alignItems: 'center',
                bgcolor: '#202c33'
              }}>
-               {previewFile?.type.startsWith('image/') && previewUrl ? (
+               {(isImage || previewFile?.type.startsWith('image/')) && previewUrl ? (
                  <img src={previewUrl} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                ) : (
-                 <InsertDriveFileRoundedIcon sx={{ color: '#8696a0' }} />
+                 <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.25 }}>
+                   <InsertDriveFileRoundedIcon
+                     sx={{ color: documentInfo?.color ?? '#8696a0', fontSize: 22 }}
+                   />
+                   <Typography
+                     sx={{
+                       color: documentInfo?.color ?? '#8696a0',
+                       fontSize: '0.55rem',
+                       fontWeight: 800,
+                       lineHeight: 1,
+                     }}
+                   >
+                     {documentInfo?.label ?? 'FILE'}
+                   </Typography>
+                 </Box>
                )}
              </Box>
              <Box sx={{
@@ -139,7 +160,9 @@ export function MediaEditorModal({
                borderRadius: '8px',
                display: 'flex', justifyContent: 'center', alignItems: 'center',
                cursor: 'pointer'
-             }}>
+             }}
+             onClick={onReplace}
+             >
                <AddRoundedIcon sx={{ color: '#e9edef' }} />
              </Box>
           </Box>

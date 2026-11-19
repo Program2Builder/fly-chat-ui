@@ -10,12 +10,6 @@ import PollRoundedIcon from '@mui/icons-material/PollRounded'
 import EventRoundedIcon from '@mui/icons-material/EventRounded'
 import MicRoundedIcon from '@mui/icons-material/MicRounded'
 import SendRoundedIcon from '@mui/icons-material/SendRounded'
-import CloseRoundedIcon from '@mui/icons-material/CloseRounded'
-import CropRotateRoundedIcon from '@mui/icons-material/CropRotateRounded'
-import AutoFixHighRoundedIcon from '@mui/icons-material/AutoFixHighRounded'
-import TitleRoundedIcon from '@mui/icons-material/TitleRounded'
-import HighlightAltRoundedIcon from '@mui/icons-material/HighlightAltRounded'
-import FileDownloadOutlinedIcon from '@mui/icons-material/FileDownloadOutlined'
 import {
   Alert,
   Box,
@@ -26,24 +20,10 @@ import {
   ListItemIcon,
   ListItemText,
   TextField,
-  Dialog,
-  Slide,
-  Typography,
 } from '@mui/material'
-import type { TransitionProps } from '@mui/material/transitions'
-import React from 'react'
 import EmojiPicker, { Theme } from 'emoji-picker-react'
 import type { ActiveConversation } from '../types/chat'
 import { MediaEditorModal } from './media-editor/MediaEditorModal'
-
-const Transition = React.forwardRef(function Transition(
-  props: TransitionProps & {
-    children: React.ReactElement<any, any>
-  },
-  ref: React.Ref<unknown>,
-) {
-  return <Slide direction="up" ref={ref} {...props} />
-})
 
 interface MessageComposerProps {
   connected: boolean
@@ -56,7 +36,6 @@ interface MessageComposerProps {
 
 export function MessageComposer({
   connected,
-  activeConversation,
   uploading,
   onSendText,
   onSendMedia,
@@ -90,18 +69,25 @@ export function MessageComposer({
   const [previewFile, setPreviewFile] = useState<File | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewCaption, setPreviewCaption] = useState('')
+  // Files picked through "Document" are sent untouched, like WhatsApp, even
+  // when they happen to be images.
+  const [previewAsDocument, setPreviewAsDocument] = useState(false)
+  const uploadAsDocumentRef = useRef(false)
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     setAttachAnchorEl(null)
     if (!file) return
-    
+
+    setPreviewAsDocument(uploadAsDocumentRef.current)
     setPreviewFile(file)
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
     setPreviewUrl(URL.createObjectURL(file))
     
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
     }
+    uploadAsDocumentRef.current = false
   }
 
   const cancelPreview = () => {
@@ -109,16 +95,17 @@ export function MessageComposer({
     setPreviewFile(null)
     setPreviewUrl(null)
     setPreviewCaption('')
+    setPreviewAsDocument(false)
     setLocalError('')
   }
 
-  const sendPreview = async (finalFile?: File | null, metadata?: { startTime: number, endTime: number }) => {
+  const sendPreview = async (finalFile?: File | null) => {
     const fileToSend = finalFile || previewFile
     if (!fileToSend) return
     try {
       setLocalError('')
-      // Pass metadata along to the parent via an extended signature if modifying useChatConnection later.
-      // For now, we utilize the standard onSendMedia with the resolved blob/file.
+      // Video trim metadata is not part of the upload contract yet, so the
+      // resolved file/blob is sent through the standard media callback.
       await onSendMedia(fileToSend, previewCaption)
       cancelPreview()
     } catch (error) {
@@ -126,10 +113,11 @@ export function MessageComposer({
     }
   }
 
-  const triggerFileUpload = (accept?: string) => {
+  const triggerFileUpload = (accept?: string, asDocument = false) => {
+    uploadAsDocumentRef.current = asDocument
     if (fileInputRef.current) {
       if (accept) fileInputRef.current.accept = accept
-      else fileInputRef.current.removeAttribute('accept')
+      else fileInputRef.current.accept = '*/*'
       fileInputRef.current.click()
     }
   }
@@ -229,7 +217,7 @@ export function MessageComposer({
         }}
       >
         <MenuList sx={{ py: 1 }}>
-          <MenuItem sx={{ py: 1.25, px: 3 }} onClick={() => triggerFileUpload()}>
+          <MenuItem sx={{ py: 1.25, px: 3 }} onClick={() => triggerFileUpload(undefined, true)}>
             <ListItemIcon><InsertDriveFileRoundedIcon sx={{ color: '#7F66FF' }} /></ListItemIcon>
             <ListItemText primaryTypographyProps={{ fontSize: '1rem' }}>Document</ListItemText>
           </MenuItem>
@@ -290,8 +278,15 @@ export function MessageComposer({
           previewUrl={previewUrl}
           previewCaption={previewCaption}
           setPreviewCaption={setPreviewCaption}
+          asDocument={previewAsDocument}
+          onReplace={() =>
+            triggerFileUpload(
+              previewAsDocument ? undefined : 'image/*,video/*',
+              previewAsDocument,
+            )
+          }
           onClose={cancelPreview}
-          onSend={(file, metadata) => sendPreview(file, metadata)}
+          onSend={(file) => sendPreview(file)}
           uploading={uploading}
         />
       )}

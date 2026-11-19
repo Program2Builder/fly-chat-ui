@@ -68,12 +68,22 @@ function appendMessageWithLiveMerge(messages: ChatMessage[], incoming: ChatMessa
     if (incoming.id && message.id === incoming.id) {
       return true
     }
-    // Simple fingerprinting fallback if IDs are missing
+    // Simple fingerprinting fallback for optimistic messages that have not
+    // received their server id yet. Compare media by mediaId, because the
+    // server may normalize a missing caption from `undefined` to `null`/''.
+    const hasMedia = Boolean(message.mediaId) || Boolean(incoming.mediaId)
+    const sameMedia = Boolean(message.mediaId) && message.mediaId === incoming.mediaId
+    const sameContent =
+      (message.content ?? '').trim() === (incoming.content ?? '').trim()
+    const sameBody = hasMedia ? sameMedia : sameContent
+
     return (
       message.senderId === incoming.senderId &&
       message.type === incoming.type &&
-      message.content === incoming.content &&
-      Math.abs((message.timestamp ? new Date(message.timestamp).getTime() : 0) - incomingTime) < 15000
+      sameBody &&
+      Math.abs((message.timestamp ? new Date(message.timestamp).getTime() : 0) - incomingTime) < 15000 &&
+      // Never collapse two distinct server messages together.
+      !(message.id && incoming.id)
     )
   })
 

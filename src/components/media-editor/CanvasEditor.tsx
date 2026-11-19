@@ -1,4 +1,4 @@
-import React, { useRef, useImperativeHandle, forwardRef, useEffect, useCallback } from 'react'
+import { useRef, useImperativeHandle, forwardRef, useEffect, useCallback } from 'react'
 import { Box } from '@mui/material'
 import { useCanvasEditor } from './hooks/useCanvasEditor'
 import { Toolbar } from './Toolbar'
@@ -14,6 +14,7 @@ export interface CanvasEditorRef {
 
 export const CanvasEditor = forwardRef<CanvasEditorRef, CanvasEditorProps>(({ imageUrl, onClose }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
 
   const {
     activeTool,
@@ -31,7 +32,7 @@ export const CanvasEditor = forwardRef<CanvasEditorRef, CanvasEditorProps>(({ im
     redo,
     deleteSelected,
     exportBlob,
-  } = useCanvasEditor(canvasRef, imageUrl)
+  } = useCanvasEditor(canvasRef, imageUrl, containerRef)
 
   useImperativeHandle(ref, () => ({ exportBlob }))
 
@@ -84,6 +85,7 @@ export const CanvasEditor = forwardRef<CanvasEditorRef, CanvasEditorProps>(({ im
         changeDrawColor={changeDrawColor}
       />
       <Box
+        ref={containerRef}
         sx={{
           flex: 1,
           display: 'flex',
